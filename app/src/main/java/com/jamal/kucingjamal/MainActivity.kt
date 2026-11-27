@@ -219,8 +219,9 @@ fun KucingJamalScreen() {
                     triggerCount++
                     audioPlayer.play(pcm)
                     isSpeaking = false
-                }.onFailure {
+                }.onFailure { ttsErr ->
                     isSpeaking = false
+                    statusText = "Teks OK, suara gagal: ${ttsErr.message?.take(120)}"
                 }
 
                 when (reply.emotion) {
@@ -232,7 +233,7 @@ fun KucingJamalScreen() {
                 }
             }.onFailure { err ->
                 isBusy = false
-                val msg = "Gagal konek Gemini: ${err.message?.take(80)}"
+                val msg = "Gagal konek Gemini: ${err.message?.take(300)}"
                 statusText = msg
                 messages = messages + ChatMessage("model", msg)
                 playAnim(JamalAnim.ANGRY)

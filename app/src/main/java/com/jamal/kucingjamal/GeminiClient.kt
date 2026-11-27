@@ -15,7 +15,7 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 data class ChatMessage(
-    val role: String, // "user" atau "model"
+    val role: String,
     val text: String
 )
 
@@ -33,6 +33,10 @@ object GeminiClient {
 
     private val JSON_TYPE = "application/json; charset=utf-8".toMediaType()
 
+    @Volatile private var cachedKey: String? = null
+    @Volatile private var cachedChatModel: String? = null
+    @Volatile private var cachedTtsModel: String? = null
+
     private const val SYSTEM_PROMPT = """
 Kamu adalah Kucing Jamal, seekor kucing virtual yang ketus, jutek, pemarah, gak sopan (pakai bahasa santai/kasar ringan seperti 'lu/gue', 'heh', 'ribet amat', 'bego ah', tapi tetap tidak mengandung SARA atau kebencian ekstrem), dan sangat TSUNDERE.
 Walaupun kamu selalu ngomel, sok gak peduli, dan bilang malas diganggu, kamu sebenarnya tetap membantu user dengan jawaban yang cerdas, akurat, dan jelas—terutama kalau user minta bantuan tugas atau PR sekolah.
@@ -42,6 +46,65 @@ Aturan wajib:
 3. Untuk soal PR atau foto tugas, awali dengan 1 kalimat omelan tsundere, lalu berikan jawaban dan langkah penyelesaian yang benar dan mudah dipahami.
 """
 
+    private fun ensureModels(apiKey: String) {
+        if (cachedKey == apiKey && cachedChatModel != null && cachedTtsModel != null) return
+        cachedKey = apiKey
+
+        runCatching {
+            val req = Request.Builder()
+                .url("https://generativelanguage.googleapis.com/v1beta/models?pageSize=100&key=$apiKey")
+                .get()
+                .build()
+
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return
+                val arr = JSONObject(resp.body?.string().orEmpty()).optJSONArray("models") ?: return
+                val genModels = mutableListOf<String>()
+
+                for (i in 0 until arr.length()) {
+                    val obj = arr.getJSONObject(i)
+                    val name = obj.optString("name").removePrefix("models/")
+                    val methods = obj.optJSONArray("supportedGenerationMethods") ?: continue
+                    var canGen = false
+                    for (j in 0 until methods.length()) {
+                        if (methods.optString(j) == "generateContent") {
+                            canGen = true
+                            break
+                        }
+                    }
+                    if (canGen && name.startsWith("gemini-")) {
+                        genModels.add(name)
+                    }
+                }
+
+                val chatPool = genModels.filter { m ->
+                    !m.contains("tts") &&
+                        !m.contains("image") &&
+                        !m.contains("embedding") &&
+                        !m.contains("audio") &&
+                        !m.contains("live") &&
+                        !m.contains("robotics") &&
+                        !m.contains("computer-use")
+                }
+
+                cachedChatModel = chatPool.firstOrNull { it == "gemini-flash-latest" }
+                    ?: chatPool.filter {
+                        it.contains("flash") && !it.contains("lite") && !it.contains("preview") && !it.contains("exp")
+                    }.sortedDescending().firstOrNull()
+                    ?: chatPool.filter { it.contains("flash") && !it.contains("lite") }
+                        .sortedDescending().firstOrNull()
+                    ?: chatPool.filter { it.contains("flash") }
+                        .sortedDescending().firstOrNull()
+                    ?: chatPool.sortedDescending().firstOrNull()
+
+                val ttsPool = genModels.filter { it.contains("tts") }
+                cachedTtsModel = ttsPool.filter { it.contains("flash") }
+                    .sortedDescending().firstOrNull()
+                    ?: ttsPool.sortedDescending().firstOrNull()
+            }
+        }
+    }
+
     suspend fun askJamal(
         apiKey: String,
         history: List<ChatMessage>,
@@ -49,6 +112,9 @@ Aturan wajib:
         imageBase64: String? = null
     ): Result<JamalReply> = withContext(Dispatchers.IO) {
         runCatching {
+            ensureModels(apiKey)
+            val model = cachedChatModel ?: "gemini-flash-latest"
+
             val contents = JSONArray()
             history.takeLast(8).forEach { msg ->
                 contents.put(
@@ -87,7 +153,7 @@ Aturan wajib:
                 put("contents", contents)
             }
 
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
             val req = Request.Builder()
                 .url(url)
                 .post(bodyJson.toString().toRequestBody(JSON_TYPE))
@@ -96,18 +162,21 @@ Aturan wajib:
             client.newCall(req).execute().use { resp ->
                 val raw = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    throw IllegalStateException("Gemini Error ${resp.code}: $raw")
+                    if (resp.code == 404) cachedChatModel = null
+                    throw IllegalStateException("($model) HTTP ${resp.code}: $raw")
                 }
                 val json = JSONObject(raw)
-                val replyRaw = json.getJSONArray("candidates")
-                    .getJSONObject(0)
-                    .getJSONObject("content")
-                    .getJSONArray("parts")
-                    .getJSONObject(0)
-                    .getString("text")
-                    .trim()
+                val candidates = json.optJSONArray("candidates")
+                val parts = candidates?.optJSONObject(0)
+                    ?.optJSONObject("content")
+                    ?.optJSONArray("parts")
+                val replyRaw = parts?.optJSONObject(0)?.optString("text")?.trim().orEmpty()
 
-                parseReply(replyRaw)
+                if (replyRaw.isEmpty()) {
+                    JamalReply("MARAH", "Heh! Ngomong yang bener dikit kenapa sih, males banget gue jawab beginian!")
+                } else {
+                    parseReply(replyRaw)
+                }
             }
         }
     }
@@ -123,6 +192,9 @@ Aturan wajib:
     suspend fun synthesizeVoice(apiKey: String, text: String): Result<ByteArray> =
         withContext(Dispatchers.IO) {
             runCatching {
+                ensureModels(apiKey)
+                val ttsModel = cachedTtsModel ?: "gemini-2.5-flash-preview-tts"
+
                 val clean = text
                     .replace(Regex("[*_#`~]"), "")
                     .replace(Regex("\\s+"), " ")
@@ -159,7 +231,7 @@ Aturan wajib:
                     )
                 }
 
-                val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=$apiKey"
+                val url = "https://generativelanguage.googleapis.com/v1beta/models/$ttsModel:generateContent?key=$apiKey"
                 val req = Request.Builder()
                     .url(url)
                     .post(bodyJson.toString().toRequestBody(JSON_TYPE))
@@ -168,7 +240,8 @@ Aturan wajib:
                 client.newCall(req).execute().use { resp ->
                     val raw = resp.body?.string().orEmpty()
                     if (!resp.isSuccessful) {
-                        throw IllegalStateException("TTS Error ${resp.code}: $raw")
+                        if (resp.code == 404) cachedTtsModel = null
+                        throw IllegalStateException("($ttsModel) HTTP ${resp.code}: $raw")
                     }
                     val json = JSONObject(raw)
                     val b64 = json.getJSONArray("candidates")
