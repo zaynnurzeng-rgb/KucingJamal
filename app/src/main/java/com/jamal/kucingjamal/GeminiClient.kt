@@ -39,6 +39,7 @@ object GeminiClient {
     private val JSON_TYPE = "application/json; charset=utf-8".toMediaType()
 
     private val CHAT_FALLBACK_CHAIN = listOf(
+        "gemini-4-hydrogen",
         "gemini-3.5-flash-lite",
         "gemini-3.6-flash",
         "gemma-4-31b-a4b-it"
