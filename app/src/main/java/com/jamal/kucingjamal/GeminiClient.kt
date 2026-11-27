@@ -393,7 +393,7 @@ Aturan wajib:
         return digest.joinToString("") { "%02x".format(it) }
     }
 
-    private fun buildTtsBody(promptText: String): String = JSONObject().apply {
+    private fun buildTtsBody(promptText: String, voiceName: String): String = JSONObject().apply {
         put(
             "contents",
             JSONArray().put(
@@ -413,7 +413,7 @@ Aturan wajib:
                         "voiceConfig",
                         JSONObject().put(
                             "prebuiltVoiceConfig",
-                            JSONObject().put("voiceName", "Puck")
+                            JSONObject().put("voiceName", voiceName)
                         )
                     )
                 )
@@ -424,7 +424,8 @@ Aturan wajib:
     suspend fun synthesizeVoiceCached(
         context: Context,
         apiKeysRaw: String,
-        text: String
+        text: String,
+        voiceName: String = "Puck"
     ): Result<ByteArray> = withContext(Dispatchers.IO) {
         runCatching {
             val clean = text
@@ -435,10 +436,19 @@ Aturan wajib:
 
             if (clean.isBlank()) throw IllegalArgumentException("Teks kosong")
 
+            val safeVoice = voiceName.trim().ifBlank { "Puck" }
             val cacheDir = File(context.filesDir, "jamal_tts_v3").apply { mkdirs() }
-            val cacheFile = File(cacheDir, "${sha256(clean)}.pcm")
+            val cacheFile = File(cacheDir, "${safeVoice.lowercase()}_${sha256(clean)}.pcm")
             if (cacheFile.exists() && cacheFile.length() > 100L) {
                 return@runCatching cacheFile.readBytes()
+            }
+
+            // Kompatibilitas cache lama khusus Puck
+            if (safeVoice.equals("Puck", ignoreCase = true)) {
+                val legacyFile = File(cacheDir, "${sha256(clean)}.pcm")
+                if (legacyFile.exists() && legacyFile.length() > 100L) {
+                    return@runCatching legacyFile.readBytes()
+                }
             }
 
             val keys = parseApiKeys(apiKeysRaw)
@@ -462,7 +472,7 @@ Aturan wajib:
 
                 for (ttsModel in candidates) {
                     for (promptText in promptVariants) {
-                        val bodyJson = buildTtsBody(promptText)
+                        val bodyJson = buildTtsBody(promptText, safeVoice)
                         val url = "https://generativelanguage.googleapis.com/v1beta/models/$ttsModel:generateContent?key=$apiKey"
                         val req = Request.Builder()
                             .url(url)

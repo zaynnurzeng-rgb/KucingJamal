@@ -37,6 +37,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
@@ -82,6 +83,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.Locale
 import kotlin.math.hypot
+import kotlin.math.roundToInt
 
 enum class JamalAnim(val folder: String, val frames: Int, val sound: String? = null) {
     IDLE("idle", 1),
@@ -193,6 +195,7 @@ fun KucingJamalScreen() {
                 ?: BuildConfig.GEMINI_API_KEY
         )
     }
+    var appSettings by remember { mutableStateOf(AppSettingsStorage.load(context)) }
     var showSettings by remember { mutableStateOf(false) }
     var showMemoryDialog by remember { mutableStateOf(false) }
     var showChat by remember { mutableStateOf(false) }
@@ -271,14 +274,12 @@ fun KucingJamalScreen() {
         )
     }
 
-    // Simpan riwayat obrolan secara permanen tiap ada perubahan
     LaunchedEffect(messages) {
         withContext(Dispatchers.IO) {
             ChatStorage.save(context, messages)
         }
     }
 
-    // Perbarui decay Kenyang & Mood secara berkala saat aplikasi terbuka
     LaunchedEffect(Unit) {
         while (true) {
             delay(180_000L)
@@ -311,6 +312,7 @@ fun KucingJamalScreen() {
         text: String,
         delayMs: Long = 0L,
         forceTalkAnim: Boolean = false,
+        voiceOverride: String? = null,
         onDone: (() -> Unit)? = null
     ) {
         if (!hasValidKeys() || text.isBlank()) {
@@ -318,8 +320,9 @@ fun KucingJamalScreen() {
             return
         }
         stopCurrentSpeech()
+        val chosenVoice = voiceOverride ?: appSettings.voiceName
         speechJob = scope.launch {
-            val res = GeminiClient.synthesizeVoiceCached(context, apiKeysRaw, text)
+            val res = GeminiClient.synthesizeVoiceCached(context, apiKeysRaw, text, chosenVoice)
             if (delayMs > 0L) delay(delayMs)
             res.onSuccess { pcm ->
                 ttsErrorBanner = null
@@ -370,7 +373,6 @@ fun KucingJamalScreen() {
         }
     }
 
-    // Ucapkan sapaan bubble pertama kali saat aplikasi masuk layar utama
     LaunchedEffect(Unit) {
         markActive()
         if (hasValidKeys()) {
@@ -443,7 +445,7 @@ fun KucingJamalScreen() {
 
         mimicJob = scope.launch {
             val res = voiceMimicEngine.recordAndPitchShift(
-                pitchFactor = 1.48f,
+                pitchFactor = appSettings.mimicPitch,
                 maxDurationMs = 8000L,
                 onVoiceDetected = {
                     scope.launch {
@@ -602,7 +604,7 @@ fun KucingJamalScreen() {
         }
     }
 
-    // Engine Animasi ~16 FPS + Perilaku Idle Otomatis
+    // Engine Animasi Dinamis (mengikuti slider FPS di Option: 12-24 fps) + Idle Otomatis
     LaunchedEffect(currentAnim, triggerCount) {
         when (currentAnim) {
             JamalAnim.IDLE -> {
@@ -645,8 +647,9 @@ fun KucingJamalScreen() {
                         val path = String.format(Locale.US, "tom/animations/talk/frame_%03d.webp", i)
                         val bmp = withContext(Dispatchers.IO) { loadFrameBitmap(context, path) }
                         if (bmp != null) currentFrame = bmp
+                        val targetMs = (1000L / appSettings.animFps.coerceIn(12, 24)) + 3L
                         val dt = System.currentTimeMillis() - t0
-                        if (dt < 65L) delay(65L - dt)
+                        if (dt < targetMs) delay(targetMs - dt)
                     }
                 }
                 currentFrame = idleBitmap
@@ -662,8 +665,9 @@ fun KucingJamalScreen() {
                     )
                     val bmp = withContext(Dispatchers.IO) { loadFrameBitmap(context, path) }
                     if (bmp != null) currentFrame = bmp
+                    val targetMs = 1000L / appSettings.animFps.coerceIn(12, 24)
                     val dt = System.currentTimeMillis() - t0
-                    if (dt < 62L) delay(62L - dt)
+                    if (dt < targetMs) delay(targetMs - dt)
                 }
                 markActive()
                 currentAnim = if (isSpeaking) JamalAnim.TALK else JamalAnim.IDLE
@@ -679,6 +683,12 @@ fun KucingJamalScreen() {
         focusedContainerColor = Color.White,
         unfocusedContainerColor = Color.White,
         cursorColor = GamePalette.Teal
+    )
+
+    val gameSliderColors = SliderDefaults.colors(
+        thumbColor = GamePalette.GreenBtn,
+        activeTrackColor = GamePalette.LimeTop,
+        inactiveTrackColor = GamePalette.TrackBg
     )
 
     Box(
@@ -758,13 +768,12 @@ fun KucingJamalScreen() {
             )
         }
 
-        // Layer 2: Top Game HUD Hijau Limau (Mood + Kenyang + Memori + Option) + Bubble Dialog Krem
+        // Layer 2: Top Game HUD Hijau Limau + Bubble Ucapan Krem
         Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
         ) {
-            // Top HUD Bar Hijau Limau dengan Bevel 3D
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -821,7 +830,6 @@ fun KucingJamalScreen() {
                 }
             }
 
-            // Bubble Ucapan Krem + Tombol Stop Bicara
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
@@ -896,7 +904,7 @@ fun KucingJamalScreen() {
             }
         }
 
-        // Layer 3: Tombol Aksi Klasik + Tombol Makan Baru (Sisi Kiri bergaya Game Circle)
+        // Layer 3: Tombol Aksi Klasik + Makan (Sisi Kiri)
         Column(
             verticalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier
@@ -956,7 +964,7 @@ fun KucingJamalScreen() {
             }
         }
 
-        // Layer 4: Bar Asisten AI + Mode Tirukan Offline (Bawah bergaya Game Circle 3D)
+        // Layer 4: Bar Asisten AI + Mode Tirukan Offline (Bawah)
         Row(
             horizontalArrangement = Arrangement.spacedBy(14.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -1026,7 +1034,7 @@ fun KucingJamalScreen() {
         }
     }
 
-    // Dialog Memori Jangka Panjang Kucing Jamal (Gaya Game Card)
+    // Dialog Memori Jangka Panjang Kucing Jamal
     if (showMemoryDialog) {
         var newFactInput by remember { mutableStateOf("") }
         GameDialogCard(
@@ -1145,7 +1153,7 @@ fun KucingJamalScreen() {
         }
     }
 
-    // Dialog Pilih Sumber Foto PR (Gaya Game Card)
+    // Dialog Pilih Sumber Foto PR
     if (showPhotoSourceDialog) {
         GameDialogCard(
             title = "Kirim Soal PR",
@@ -1188,7 +1196,7 @@ fun KucingJamalScreen() {
         }
     }
 
-    // Dialog Pratinjau Foto PR + Catatan Tambahan (Gaya Game Card)
+    // Dialog Pratinjau Foto PR
     pendingPrPhoto?.let { photo ->
         GameDialogCard(
             title = "Pratinjau Soal PR",
@@ -1257,7 +1265,7 @@ fun KucingJamalScreen() {
         }
     }
 
-    // Panel Chat & Tutor PR (Gaya Game UI + Rich Text + Replay Suara + Tombol Cepat Tutor PR)
+    // Panel Chat & Tutor PR
     if (showChat) {
         val listState = rememberLazyListState()
         LaunchedEffect(messages.size, showChat) {
@@ -1276,7 +1284,6 @@ fun KucingJamalScreen() {
                     .fillMaxWidth()
                     .fillMaxHeight(0.82f)
             ) {
-                // Header Teal Panel Chat
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -1360,7 +1367,6 @@ fun KucingJamalScreen() {
                     }
                 }
 
-                // Daftar Pesan (Rich Text + Tombol Putar Ulang Suara di tiap balasan Jamal)
                 LazyColumn(
                     state = listState,
                     contentPadding = PaddingValues(14.dp),
@@ -1419,7 +1425,6 @@ fun KucingJamalScreen() {
                                     }
                                 }
 
-                                // Tombol Putar Ulang Suara pada tiap jawaban Jamal (pakai cache permanen)
                                 if (!isUser && !isErrorBubble) {
                                     Spacer(Modifier.height(4.dp))
                                     Row(
@@ -1454,7 +1459,6 @@ fun KucingJamalScreen() {
                     }
                 }
 
-                // Tombol Cepat Tutor PR (Jelaskan Lebih Simpel & Bikin 1 Soal Latihan)
                 if (messages.size > 1 && !isBusy) {
                     Row(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1490,7 +1494,6 @@ fun KucingJamalScreen() {
                     }
                 }
 
-                // Input Chat
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
@@ -1527,7 +1530,7 @@ fun KucingJamalScreen() {
         }
     }
 
-    // Konfirmasi Hapus Riwayat Chat (Gaya Game Card)
+    // Konfirmasi Hapus Riwayat Chat
     if (showClearConfirm) {
         GameDialogCard(
             title = "Hapus Riwayat Chat?",
@@ -1567,66 +1570,206 @@ fun KucingJamalScreen() {
         }
     }
 
-    // Dialog Option / Rotasi Multi API Key (Gaya Game Card OPTION)
+    // Dialog Option Lengkap (Suara Gemini + Pitch Tirukan + FPS Animasi + Cache + Multi API Key)
     if (showSettings) {
         var tempKeys by remember {
             mutableStateOf(GeminiClient.parseApiKeys(apiKeysRaw).joinToString("\n"))
         }
+        var tempVoice by remember { mutableStateOf(appSettings.voiceName) }
+        var tempPitch by remember { mutableFloatStateOf(appSettings.mimicPitch) }
+        var tempFps by remember { mutableIntStateOf(appSettings.animFps) }
+        var cacheStats by remember { mutableStateOf(AppSettingsStorage.getTtsCacheStats(context)) }
         val detectedCount = GeminiClient.parseApiKeys(tempKeys).size
 
         GameDialogCard(
-            title = "Option • Multi API Key",
+            title = "Option • Kucing Jamal",
             headerColor = GamePalette.Teal,
             headerShadow = GamePalette.TealShadow,
             onDismiss = { showSettings = false }
         ) {
-            Text(
-                "Masukkan 1 atau beberapa Gemini API Key (1 key per baris dari Project/akun berbeda). Otomatis pindah jika kuota habis.",
-                color = GamePalette.TextBrownSoft,
-                fontSize = 12.sp
-            )
-            Spacer(Modifier.height(8.dp))
-            Box(
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(Color.White)
-                    .border(1.5.dp, GamePalette.CreamDark, RoundedCornerShape(12.dp))
-                    .padding(horizontal = 10.dp, vertical = 7.dp)
+                    .heightIn(max = 460.dp)
+                    .verticalScroll(rememberScrollState())
             ) {
+                // 1. Karakter Suara Gemini
                 Text(
-                    text = GeminiClient.getRotationStatus(apiKeysRaw),
+                    text = "KARAKTER SUARA GEMINI",
+                    color = GamePalette.TextBrown,
                     fontSize = 12.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = GamePalette.TealShadow
+                    fontWeight = FontWeight.ExtraBold
                 )
-            }
-            Spacer(Modifier.height(10.dp))
-            OutlinedTextField(
-                value = tempKeys,
-                onValueChange = { tempKeys = it },
-                label = { Text("AIza... (terdeteksi $detectedCount key)") },
-                minLines = 3,
-                maxLines = 5,
-                colors = fieldColors,
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            )
-            if (BuildConfig.GEMINI_API_KEY.isNotBlank()) {
                 Spacer(Modifier.height(6.dp))
-                Text(
-                    text = "↺ Muat ulang dari GitHub Secret",
-                    color = GamePalette.Teal,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Bold,
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                     modifier = Modifier
-                        .clickable {
-                            tempKeys = GeminiClient.parseApiKeys(BuildConfig.GEMINI_API_KEY)
-                                .joinToString("\n")
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                ) {
+                    AppSettingsStorage.availableVoices.forEach { opt ->
+                        val selected = tempVoice.equals(opt.name, ignoreCase = true)
+                        GamePillButton(
+                            text = "${opt.name} (${opt.label})",
+                            bgColor = if (selected) GamePalette.GreenBtn else GamePalette.Teal,
+                            shadowColor = if (selected) GamePalette.GreenBtnShadow else GamePalette.TealShadow,
+                            fontSize = 11.sp
+                        ) {
+                            tempVoice = opt.name
                         }
-                        .padding(vertical = 4.dp)
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+
+                // 2. Slider Pitch Mode Tirukan
+                Row(
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "PITCH TIRUKAN OFFLINE",
+                        color = GamePalette.TextBrown,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                    Text(
+                        text = String.format(Locale.US, "%.2fx", tempPitch),
+                        color = GamePalette.TealShadow,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                }
+                Slider(
+                    value = tempPitch,
+                    onValueChange = { tempPitch = it },
+                    valueRange = 1.15f..1.75f,
+                    colors = gameSliderColors
+                )
+
+                // 3. Slider Kecepatan Animasi (FPS)
+                Row(
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "KECEPATAN ANIMASI",
+                        color = GamePalette.TextBrown,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                    Text(
+                        text = "$tempFps FPS",
+                        color = GamePalette.TealShadow,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                }
+                Slider(
+                    value = tempFps.toFloat(),
+                    onValueChange = { tempFps = it.roundToInt().coerceIn(12, 24) },
+                    valueRange = 12f..24f,
+                    steps = 11,
+                    colors = gameSliderColors
+                )
+
+                Spacer(Modifier.height(6.dp))
+
+                // 4. Cache Suara
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color.White)
+                        .border(1.5.dp, GamePalette.CreamDark, RoundedCornerShape(14.dp))
+                        .padding(horizontal = 10.dp, vertical = 8.dp)
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "CACHE SUARA LOKAL",
+                            color = GamePalette.TextBrown,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                        Text(
+                            text = cacheStats.formatted(),
+                            color = GamePalette.TextBrownSoft,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    GamePillButton(
+                        text = "BERSIHKAN",
+                        bgColor = GamePalette.Red,
+                        shadowColor = GamePalette.RedShadow,
+                        fontSize = 11.sp,
+                        enabled = cacheStats.fileCount > 0
+                    ) {
+                        cacheStats = AppSettingsStorage.clearTtsCache(context)
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+
+                // 5. Rotasi Multi API Key
+                Text(
+                    text = "ROTASI MULTI API KEY",
+                    color = GamePalette.TextBrown,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+                Spacer(Modifier.height(4.dp))
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color.White)
+                        .border(1.5.dp, GamePalette.CreamDark, RoundedCornerShape(12.dp))
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                ) {
+                    Text(
+                        text = GeminiClient.getRotationStatus(apiKeysRaw),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = GamePalette.TealShadow
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = tempKeys,
+                    onValueChange = { tempKeys = it },
+                    label = { Text("AIza... (terdeteksi $detectedCount key)") },
+                    minLines = 2,
+                    maxLines = 4,
+                    colors = fieldColors,
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (BuildConfig.GEMINI_API_KEY.isNotBlank()) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = "↺ Muat ulang dari GitHub Secret",
+                        color = GamePalette.Teal,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier
+                            .clickable {
+                                tempKeys = GeminiClient.parseApiKeys(BuildConfig.GEMINI_API_KEY)
+                                    .joinToString("\n")
+                            }
+                            .padding(vertical = 4.dp)
+                    )
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = "Versi v${BuildConfig.VERSION_NAME}",
+                    color = GamePalette.TextBrownSoft,
+                    fontSize = 11.sp
                 )
             }
+
             Spacer(Modifier.height(12.dp))
             Row(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -1647,18 +1790,29 @@ fun KucingJamalScreen() {
                     modifier = Modifier.weight(1.3f)
                 ) {
                     val normalized = GeminiClient.parseApiKeys(tempKeys).joinToString("\n")
-                    apiKeysRaw = normalized
-                    GeminiClient.resetKeyRotation()
-                    prefs.edit().putString("gemini_api_key", normalized).apply()
+                    val oldVoice = appSettings.voiceName
+                    val newSettings = AppSettings(
+                        voiceName = tempVoice,
+                        mimicPitch = tempPitch,
+                        animFps = tempFps
+                    )
+                    appSettings = newSettings
+                    AppSettingsStorage.save(context, newSettings)
+
+                    if (normalized != apiKeysRaw) {
+                        apiKeysRaw = normalized
+                        GeminiClient.resetKeyRotation()
+                        prefs.edit().putString("gemini_api_key", normalized).apply()
+                    }
                     ttsErrorBanner = null
-                    val count = GeminiClient.parseApiKeys(normalized).size
-                    val msg = if (count > 1) {
-                        "Oke, $count API Key cadangan udah dipasang. Aman nih buat ngoceh!"
+
+                    val msg = if (!oldVoice.equals(tempVoice, ignoreCase = true)) {
+                        "Suara gue udah diganti ke $tempVoice. Gimana, makin keren kan?!"
                     } else {
-                        "Yaudah, API Key udah disimpan. Mau nanya apaan cepetan!"
+                        "Pengaturan udah disimpan. Mau ngapain lagi cepetan!"
                     }
                     statusText = msg
-                    speakBubble(msg, forceTalkAnim = true)
+                    speakBubble(msg, forceTalkAnim = true, voiceOverride = tempVoice)
                     showSettings = false
                 }
             }

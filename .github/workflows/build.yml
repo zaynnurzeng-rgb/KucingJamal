@@ -23,15 +23,42 @@ jobs:
         with:
           gradle-version: 8.9
 
-      - name: Build Debug APK
+      - name: Siapkan Release Keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$GITHUB_WORKSPACE/release.keystore"
+            echo "RELEASE_STORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "RELEASE_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "RELEASE_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+          else
+            keytool -genkeypair -v \
+              -keystore "$GITHUB_WORKSPACE/release.keystore" \
+              -storetype PKCS12 \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -alias jamal \
+              -storepass kucingjamal123 \
+              -keypass kucingjamal123 \
+              -dname "CN=Kucing Jamal, OU=Dev, O=JamalApp, L=ID, ST=ID, C=ID"
+            echo "RELEASE_STORE_PASSWORD=kucingjamal123" >> "$GITHUB_ENV"
+            echo "RELEASE_KEY_ALIAS=jamal" >> "$GITHUB_ENV"
+            echo "RELEASE_KEY_PASSWORD=kucingjamal123" >> "$GITHUB_ENV"
+          fi
+          echo "RELEASE_STORE_FILE=$GITHUB_WORKSPACE/release.keystore" >> "$GITHUB_ENV"
+
+      - name: Build Release APK
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
-        run: gradle assembleDebug --no-daemon
+        run: gradle assembleRelease --no-daemon
 
-      - name: Upload APK
+      - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
-          name: KucingJamal-Debug-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: KucingJamal-Release-APK
+          path: app/build/outputs/apk/release/app-release.apk

@@ -16,6 +16,10 @@ val geminiApiKeys = listOfNotNull(
     .replace("\\", "\\\\")
     .replace("\"", "\\\"")
 
+val buildRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 2
+val releaseStorePath = System.getenv("RELEASE_STORE_FILE")
+val hasReleaseSigning = !releaseStorePath.isNullOrBlank() && file(releaseStorePath).exists()
+
 android {
     namespace = "com.jamal.kucingjamal"
     compileSdk = 35
@@ -24,13 +28,35 @@ android {
         applicationId = "com.jamal.kucingjamal"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = buildRunNumber
+        versionName = "1.0.$buildRunNumber"
         buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKeys\"")
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseStorePath!!)
+                storePassword = System.getenv("RELEASE_STORE_PASSWORD") ?: "kucingjamal123"
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS") ?: "jamal"
+                keyPassword = System.getenv("RELEASE_KEY_PASSWORD") ?: "kucingjamal123"
+            }
+        }
     }
 
     buildTypes {
         release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
+        }
+        debug {
             isMinifyEnabled = false
         }
     }
