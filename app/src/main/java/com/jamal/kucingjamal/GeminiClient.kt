@@ -61,55 +61,57 @@ Aturan wajib:
                 .get()
                 .build()
 
-            client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return
-                val arr = JSONObject(resp.body?.string().orEmpty()).optJSONArray("models") ?: return
-                val genModels = mutableListOf<String>()
-
-                for (i in 0 until arr.length()) {
-                    val obj = arr.getJSONObject(i)
-                    val name = obj.optString("name").removePrefix("models/")
-                    val methods = obj.optJSONArray("supportedGenerationMethods") ?: continue
-                    var canGen = false
-                    for (j in 0 until methods.length()) {
-                        if (methods.optString(j) == "generateContent") {
-                            canGen = true
-                            break
-                        }
-                    }
-                    if (canGen && name.startsWith("gemini-")) {
-                        genModels.add(name)
-                    }
-                }
-
-                val chatPool = genModels.filter { m ->
-                    !m.contains("tts") &&
-                        !m.contains("image") &&
-                        !m.contains("embedding") &&
-                        !m.contains("audio") &&
-                        !m.contains("live") &&
-                        !m.contains("robotics") &&
-                        !m.contains("computer-use")
-                }
-
-                val orderedChat = linkedSetOf<String>()
-                chatPool.filter {
-                    it.contains("flash") && !it.contains("lite") && !it.contains("preview") && !it.contains("exp") && !it.contains("latest")
-                }.sortedDescending().forEach { orderedChat.add(it) }
-                if ("gemini-flash-latest" in chatPool) orderedChat.add("gemini-flash-latest")
-                chatPool.filter { it.contains("flash") && it.contains("lite") && !it.contains("preview") }
-                    .sortedDescending().forEach { orderedChat.add(it) }
-                chatPool.filter { it.contains("flash") }
-                    .sortedDescending().forEach { orderedChat.add(it) }
-                chatPool.sortedDescending().forEach { orderedChat.add(it) }
-                chatModels = orderedChat.toList()
-
-                val ttsPool = genModels.filter { it.contains("tts") }
-                val orderedTts = linkedSetOf<String>()
-                ttsPool.filter { it.contains("flash") }.sortedDescending().forEach { orderedTts.add(it) }
-                ttsPool.sortedDescending().forEach { orderedTts.add(it) }
-                ttsModels = orderedTts.toList()
+            val (isOk, bodyStr) = client.newCall(req).execute().use { resp ->
+                resp.isSuccessful to resp.body?.string().orEmpty()
             }
+            if (!isOk) return
+
+            val arr = JSONObject(bodyStr).optJSONArray("models") ?: return
+            val genModels = mutableListOf<String>()
+
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                val name = obj.optString("name").removePrefix("models/")
+                val methods = obj.optJSONArray("supportedGenerationMethods") ?: continue
+                var canGen = false
+                for (j in 0 until methods.length()) {
+                    if (methods.optString(j) == "generateContent") {
+                        canGen = true
+                        break
+                    }
+                }
+                if (canGen && name.startsWith("gemini-")) {
+                    genModels.add(name)
+                }
+            }
+
+            val chatPool = genModels.filter { m ->
+                !m.contains("tts") &&
+                    !m.contains("image") &&
+                    !m.contains("embedding") &&
+                    !m.contains("audio") &&
+                    !m.contains("live") &&
+                    !m.contains("robotics") &&
+                    !m.contains("computer-use")
+            }
+
+            val orderedChat = linkedSetOf<String>()
+            chatPool.filter {
+                it.contains("flash") && !it.contains("lite") && !it.contains("preview") && !it.contains("exp") && !it.contains("latest")
+            }.sortedDescending().forEach { orderedChat.add(it) }
+            if ("gemini-flash-latest" in chatPool) orderedChat.add("gemini-flash-latest")
+            chatPool.filter { it.contains("flash") && it.contains("lite") && !it.contains("preview") }
+                .sortedDescending().forEach { orderedChat.add(it) }
+            chatPool.filter { it.contains("flash") }
+                .sortedDescending().forEach { orderedChat.add(it) }
+            chatPool.sortedDescending().forEach { orderedChat.add(it) }
+            chatModels = orderedChat.toList()
+
+            val ttsPool = genModels.filter { it.contains("tts") }
+            val orderedTts = linkedSetOf<String>()
+            ttsPool.filter { it.contains("flash") }.sortedDescending().forEach { orderedTts.add(it) }
+            ttsPool.sortedDescending().forEach { orderedTts.add(it) }
+            ttsModels = orderedTts.toList()
         }
     }
 
@@ -177,32 +179,33 @@ Aturan wajib:
                         .post(bodyJson.toRequestBody(JSON_TYPE))
                         .build()
 
-                    client.newCall(req).execute().use { resp ->
-                        val raw = resp.body?.string().orEmpty()
-                        if (resp.isSuccessful) {
-                            val json = JSONObject(raw)
-                            val parts = json.optJSONArray("candidates")
-                                ?.optJSONObject(0)
-                                ?.optJSONObject("content")
-                                ?.optJSONArray("parts")
-                            val replyRaw = parts?.optJSONObject(0)?.optString("text")?.trim().orEmpty()
-                            return@runCatching if (replyRaw.isEmpty()) {
-                                JamalReply("MARAH", "Heh! Ngomong yang bener dikit kenapa sih, males banget gue jawab beginian!")
-                            } else {
-                                parseReply(replyRaw)
-                            }
-                        }
+                    val (isOk, code, raw) = client.newCall(req).execute().use { resp ->
+                        Triple(resp.isSuccessful, resp.code, resp.body?.string().orEmpty())
+                    }
 
-                        lastErr = "($model) HTTP ${resp.code}: ${extractApiErrorMessage(raw)}"
-                        if (resp.code == 404) {
-                            break // langsung lompat ke model cadangan berikutnya
-                        }
-                        if (resp.code == 503 || resp.code == 429 || resp.code >= 500) {
-                            if (attempt == 1) delay(700L)
-                            else break // coba model cadangan berikutnya
+                    if (isOk) {
+                        val json = JSONObject(raw)
+                        val parts = json.optJSONArray("candidates")
+                            ?.optJSONObject(0)
+                            ?.optJSONObject("content")
+                            ?.optJSONArray("parts")
+                        val replyRaw = parts?.optJSONObject(0)?.optString("text")?.trim().orEmpty()
+                        return@runCatching if (replyRaw.isEmpty()) {
+                            JamalReply("MARAH", "Heh! Ngomong yang bener dikit kenapa sih, males banget gue jawab beginian!")
                         } else {
-                            throw IllegalStateException(lastErr)
+                            parseReply(replyRaw)
                         }
+                    }
+
+                    lastErr = "($model) HTTP $code: ${extractApiErrorMessage(raw)}"
+                    if (code == 404) {
+                        break
+                    }
+                    if (code == 503 || code == 429 || code >= 500) {
+                        if (attempt == 1) delay(700L)
+                        else break
+                    } else {
+                        throw IllegalStateException(lastErr)
                     }
                 }
             }
@@ -248,7 +251,6 @@ Aturan wajib:
                 listOf("gemini-2.5-flash-preview-tts")
             }
 
-            // Kirim teks murni Jamal saja agar instruksi tidak pernah ikut dibacakan
             val bodyJson = JSONObject().apply {
                 put(
                     "contents",
@@ -287,32 +289,33 @@ Aturan wajib:
                         .post(bodyJson.toRequestBody(JSON_TYPE))
                         .build()
 
-                    client.newCall(req).execute().use { resp ->
-                        val raw = resp.body?.string().orEmpty()
-                        if (resp.isSuccessful) {
-                            val json = JSONObject(raw)
-                            val b64 = json.getJSONArray("candidates")
-                                .getJSONObject(0)
-                                .getJSONObject("content")
-                                .getJSONArray("parts")
-                                .getJSONObject(0)
-                                .getJSONObject("inlineData")
-                                .getString("data")
+                    val (isOk, code, raw) = client.newCall(req).execute().use { resp ->
+                        Triple(resp.isSuccessful, resp.code, resp.body?.string().orEmpty())
+                    }
 
-                            val pcm = Base64.decode(b64, Base64.DEFAULT)
-                            runCatching { cacheFile.writeBytes(pcm) }
-                            return@runCatching pcm
-                        }
+                    if (isOk) {
+                        val json = JSONObject(raw)
+                        val b64 = json.getJSONArray("candidates")
+                            .getJSONObject(0)
+                            .getJSONObject("content")
+                            .getJSONArray("parts")
+                            .getJSONObject(0)
+                            .getJSONObject("inlineData")
+                            .getString("data")
 
-                        lastErr = "($ttsModel) HTTP ${resp.code}: ${extractApiErrorMessage(raw)}"
-                        if (resp.code == 503 || resp.code == 429 || resp.code >= 500) {
-                            if (attempt == 1) delay(600L)
-                            else break
-                        } else if (resp.code == 404) {
-                            break
-                        } else {
-                            throw IllegalStateException(lastErr)
-                        }
+                        val pcm = Base64.decode(b64, Base64.DEFAULT)
+                        runCatching { cacheFile.writeBytes(pcm) }
+                        return@runCatching pcm
+                    }
+
+                    lastErr = "($ttsModel) HTTP $code: ${extractApiErrorMessage(raw)}"
+                    if (code == 503 || code == 429 || code >= 500) {
+                        if (attempt == 1) delay(600L)
+                        else break
+                    } else if (code == 404) {
+                        break
+                    } else {
+                        throw IllegalStateException(lastErr)
                     }
                 }
             }
