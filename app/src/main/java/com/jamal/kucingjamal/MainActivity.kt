@@ -29,17 +29,22 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Chat
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material3.*
@@ -182,19 +187,24 @@ fun KucingJamalScreen() {
         )
     }
     var showSettings by remember { mutableStateOf(false) }
+    var showMemoryDialog by remember { mutableStateOf(false) }
     var showChat by remember { mutableStateOf(false) }
     var showClearConfirm by remember { mutableStateOf(false) }
     var showPhotoSourceDialog by remember { mutableStateOf(false) }
     var pendingPrPhoto by remember { mutableStateOf<PreparedPrPhoto?>(null) }
     var prNoteInput by remember { mutableStateOf("") }
     var cameraPhotoUri by remember { mutableStateOf<Uri?>(null) }
+    var pendingMicAction by remember { mutableStateOf("ai") }
 
     var chatInput by remember { mutableStateOf("") }
     var messages by remember { mutableStateOf(ChatStorage.load(context)) }
+    var memories by remember { mutableStateOf(MemoryStorage.load(context)) }
     var isBusy by remember { mutableStateOf(false) }
     var isSpeaking by remember { mutableStateOf(false) }
     var isListening by remember { mutableStateOf(false) }
+    var isMimicRecording by remember { mutableStateOf(false) }
     var speechJob by remember { mutableStateOf<Job?>(null) }
+    var mimicJob by remember { mutableStateOf<Job?>(null) }
     var ttsErrorBanner by remember { mutableStateOf<String?>(null) }
     var lastInteractionAt by remember { mutableLongStateOf(System.currentTimeMillis()) }
 
@@ -207,6 +217,7 @@ fun KucingJamalScreen() {
     }
 
     val audioPlayer = remember { PcmAudioPlayer() }
+    val voiceMimicEngine = remember { VoiceMimicEngine() }
     val soundPool = remember {
         val attrs = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_GAME)
@@ -252,6 +263,10 @@ fun KucingJamalScreen() {
     fun stopCurrentSpeech() {
         speechJob?.cancel()
         speechJob = null
+        voiceMimicEngine.requestStop()
+        mimicJob?.cancel()
+        mimicJob = null
+        isMimicRecording = false
         audioPlayer.stop()
         isSpeaking = false
     }
@@ -334,8 +349,17 @@ fun KucingJamalScreen() {
         currentAnim = JamalAnim.IDLE
 
         scope.launch {
-            val res = GeminiClient.askJamal(apiKeysRaw, messages.dropLast(1), prompt, imageBase64)
+            val res = GeminiClient.askJamal(
+                apiKeysRaw = apiKeysRaw,
+                history = messages.dropLast(1),
+                userText = prompt,
+                imageBase64 = imageBase64,
+                memories = memories
+            )
             res.onSuccess { reply ->
+                if (reply.newMemories.isNotEmpty()) {
+                    memories = MemoryStorage.merge(context, memories, reply.newMemories)
+                }
                 messages = messages + ChatMessage("model", reply.text)
                 statusText = reply.text
                 isBusy = false
@@ -356,6 +380,47 @@ fun KucingJamalScreen() {
                 val chatMsg = "Gagal konek Gemini: $shortErr"
                 messages = messages + ChatMessage("model", chatMsg)
                 playAnim(JamalAnim.ANGRY, "Aduh servernya lagi rame banget, coba lagi bentar!")
+            }
+        }
+    }
+
+    fun startOfflineMimic() {
+        markActive()
+        if (isMimicRecording) {
+            voiceMimicEngine.requestStop()
+            return
+        }
+        stopCurrentSpeech()
+        isMimicRecording = true
+        playAnim(JamalAnim.LISTEN, "Mode Tirukan: ngomong aja, nanti gue ledek!", speak = false)
+
+        mimicJob = scope.launch {
+            val res = voiceMimicEngine.recordAndPitchShift(
+                pitchFactor = 1.48f,
+                maxDurationMs = 8000L,
+                onVoiceDetected = {
+                    scope.launch {
+                        statusText = "Lagi dengerin suara lu... (tap lagi buat stop)"
+                    }
+                }
+            )
+            isMimicRecording = false
+
+            res.onSuccess { pitchedPcm ->
+                statusText = "Hehe, dengerin suara lu sendiri nih!"
+                isSpeaking = true
+                currentAnim = JamalAnim.TALK
+                triggerCount++
+                audioPlayer.play(pitchedPcm)
+                isSpeaking = false
+                markActive()
+                if (currentAnim == JamalAnim.TALK) {
+                    currentAnim = JamalAnim.IDLE
+                }
+            }.onFailure { err ->
+                isSpeaking = false
+                currentAnim = JamalAnim.IDLE
+                statusText = err.message ?: "Gagal rekam suara."
             }
         }
     }
@@ -436,8 +501,10 @@ fun KucingJamalScreen() {
     val micPermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        if (granted) startVoiceInput()
-        else {
+        if (granted) {
+            if (pendingMicAction == "mimic") startOfflineMimic()
+            else startVoiceInput()
+        } else {
             val msg = "Izin mikrofon ditolak, gimana gue mau denger?!"
             statusText = msg
             speakBubble(msg, forceTalkAnim = true)
@@ -499,8 +566,9 @@ fun KucingJamalScreen() {
                     currentFrame = idleBitmap
 
                     val idleMs = System.currentTimeMillis() - lastInteractionAt
-                    val overlayOpen = showChat || showSettings || showPhotoSourceDialog || pendingPrPhoto != null
-                    if (idleMs >= 20_000L && !isBusy && !isSpeaking && !isListening && !overlayOpen) {
+                    val overlayOpen = showChat || showSettings || showMemoryDialog ||
+                        showPhotoSourceDialog || pendingPrPhoto != null
+                    if (idleMs >= 20_000L && !isBusy && !isSpeaking && !isListening && !isMimicRecording && !overlayOpen) {
                         if ((0..1).random() == 0) {
                             playAnim(
                                 JamalAnim.YAWN,
@@ -624,7 +692,7 @@ fun KucingJamalScreen() {
             )
         }
 
-        // Layer 2: Status Bubble + Tombol Stop Bicara + Tombol Pengaturan + Info Error TTS
+        // Layer 2: Status Bubble + Tombol Stop Bicara + Tombol Memori + Tombol Pengaturan
         Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
@@ -657,7 +725,7 @@ fun KucingJamalScreen() {
                 }
 
                 if (isSpeaking) {
-                    Spacer(Modifier.width(8.dp))
+                    Spacer(Modifier.width(6.dp))
                     IconButton(
                         onClick = {
                             markActive()
@@ -666,30 +734,58 @@ fun KucingJamalScreen() {
                             statusText = "Iya iya, gue diem deh!"
                         },
                         modifier = Modifier
-                            .size(42.dp)
+                            .size(40.dp)
                             .clip(CircleShape)
                             .background(Color(0xD9D32F2F))
                     ) {
                         Icon(
                             Icons.Filled.VolumeOff,
                             contentDescription = "Stop Bicara",
-                            tint = Color.White
+                            tint = Color.White,
+                            modifier = Modifier.size(20.dp)
                         )
                     }
                 }
 
-                Spacer(Modifier.width(8.dp))
+                Spacer(Modifier.width(6.dp))
+                IconButton(
+                    onClick = {
+                        markActive()
+                        showMemoryDialog = true
+                    },
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (memories.isNotEmpty()) Color(0xCC5E35B1)
+                            else Color.Black.copy(alpha = 0.62f)
+                        )
+                ) {
+                    Icon(
+                        Icons.Filled.Psychology,
+                        contentDescription = "Memori Jamal",
+                        tint = Color.White,
+                        modifier = Modifier.size(21.dp)
+                    )
+                }
+
+                Spacer(Modifier.width(6.dp))
                 IconButton(
                     onClick = {
                         markActive()
                         showSettings = true
                     },
                     modifier = Modifier
-                        .size(42.dp)
+                        .size(40.dp)
                         .clip(CircleShape)
                         .background(Color.Black.copy(alpha = 0.62f))
                 ) {
-                    Icon(Icons.Filled.Settings, contentDescription = "API Key", tint = Color.White)
+                    Icon(
+                        Icons.Filled.Settings,
+                        contentDescription = "API Key",
+                        tint = Color.White,
+                        modifier = Modifier.size(20.dp)
+                    )
                 }
             }
 
@@ -738,9 +834,9 @@ fun KucingJamalScreen() {
             }
         }
 
-        // Layer 4: Bar Asisten AI (Bawah)
+        // Layer 4: Bar Asisten AI + Mode Tirukan Offline (Bawah)
         Row(
-            horizontalArrangement = Arrangement.spacedBy(18.dp),
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -762,10 +858,24 @@ fun KucingJamalScreen() {
                 big = true
             ) {
                 markActive()
+                pendingMicAction = "ai"
                 val hasPerm = ContextCompat.checkSelfPermission(
                     context, Manifest.permission.RECORD_AUDIO
                 ) == PackageManager.PERMISSION_GRANTED
                 if (hasPerm) startVoiceInput()
+                else micPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            }
+            AiActionButton(
+                icon = Icons.Filled.RecordVoiceOver,
+                label = if (isMimicRecording) "Stop" else "Tirukan",
+                bg = if (isMimicRecording) Color(0xFFE53935) else Color(0xFF8E24AA)
+            ) {
+                markActive()
+                pendingMicAction = "mimic"
+                val hasPerm = ContextCompat.checkSelfPermission(
+                    context, Manifest.permission.RECORD_AUDIO
+                ) == PackageManager.PERMISSION_GRANTED
+                if (hasPerm) startOfflineMimic()
                 else micPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
             }
             AiActionButton(
@@ -777,6 +887,107 @@ fun KucingJamalScreen() {
                 showChat = true
             }
         }
+    }
+
+    // Dialog Memori Jangka Panjang Kucing Jamal
+    if (showMemoryDialog) {
+        var newFactInput by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { showMemoryDialog = false },
+            title = { Text("Ingatan Jamal (${memories.size})") },
+            text = {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        "Jamal otomatis mengingat fakta tentang kamu saat ngobrol, dan tetap ingat meski riwayat chat dihapus.",
+                        fontSize = 12.sp
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        OutlinedTextField(
+                            value = newFactInput,
+                            onValueChange = { newFactInput = it },
+                            placeholder = { Text("Tambah manual (misal: Nama gue Zayn)") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        IconButton(
+                            enabled = newFactInput.isNotBlank(),
+                            onClick = {
+                                memories = MemoryStorage.merge(context, memories, listOf(newFactInput))
+                                newFactInput = ""
+                            }
+                        ) {
+                            Icon(Icons.Filled.Add, contentDescription = "Tambah Ingatan")
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    if (memories.isEmpty()) {
+                        Text(
+                            "Belum ada ingatan. Coba kenalkan namamu atau hobimu ke Jamal!",
+                            fontSize = 12.sp,
+                            color = Color.Gray
+                        )
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 220.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            itemsIndexed(memories) { idx, item ->
+                                Surface(
+                                    color = Color(0xFFF3E5F5),
+                                    shape = RoundedCornerShape(10.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(start = 10.dp, end = 4.dp, top = 4.dp, bottom = 4.dp)
+                                    ) {
+                                        Text(
+                                            text = "• $item",
+                                            color = Color.Black,
+                                            fontSize = 13.sp,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        IconButton(
+                                            onClick = {
+                                                memories = MemoryStorage.removeAt(context, memories, idx)
+                                            },
+                                            modifier = Modifier.size(32.dp)
+                                        ) {
+                                            Icon(
+                                                Icons.Filled.Close,
+                                                contentDescription = "Hapus",
+                                                tint = Color(0xFF6A1B9A),
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showMemoryDialog = false }) { Text("Tutup") }
+            },
+            dismissButton = {
+                if (memories.isNotEmpty()) {
+                    TextButton(onClick = {
+                        memories = MemoryStorage.clear(context)
+                        statusText = "Semua ingatan tentang lu udah gue lupain!"
+                    }) {
+                        Text("Hapus Semua", color = Color(0xFFD32F2F))
+                    }
+                }
+            }
+        )
     }
 
     // Dialog Pilih Sumber Foto PR (Kamera Langsung vs Galeri)
@@ -994,7 +1205,7 @@ fun KucingJamalScreen() {
         AlertDialog(
             onDismissRequest = { showClearConfirm = false },
             title = { Text("Hapus Semua Riwayat Chat?") },
-            text = { Text("Semua riwayat obrolan dan jawaban PR sebelumnya bakal dihapus permanen dari HP.") },
+            text = { Text("Semua riwayat obrolan dan jawaban PR sebelumnya bakal dihapus permanen dari HP. (Ingatan jangka panjang tetap tersimpan.)") },
             confirmButton = {
                 TextButton(onClick = {
                     messages = ChatStorage.clear(context)
@@ -1113,7 +1324,7 @@ private fun AiActionButton(
         Box(
             contentAlignment = Alignment.Center,
             modifier = Modifier
-                .size(if (big) 68.dp else 54.dp)
+                .size(if (big) 64.dp else 52.dp)
                 .clip(CircleShape)
                 .background(bg.copy(alpha = 0.92f))
                 .clickable(onClick = onClick)
@@ -1122,7 +1333,7 @@ private fun AiActionButton(
                 imageVector = icon,
                 contentDescription = label,
                 tint = Color.White,
-                modifier = Modifier.size(if (big) 32.dp else 26.dp)
+                modifier = Modifier.size(if (big) 30.dp else 24.dp)
             )
         }
         Spacer(Modifier.height(4.dp))

@@ -27,7 +27,8 @@ data class ChatMessage(
 
 data class JamalReply(
     val emotion: String,
-    val text: String
+    val text: String,
+    val newMemories: List<String> = emptyList()
 )
 
 private data class ModelCatalog(
@@ -56,14 +57,21 @@ object GeminiClient {
     @Volatile private var activeChatKeyIdx = 0
     @Volatile private var activeTtsKeyIdx = 0
 
-    private const val SYSTEM_PROMPT = """
+    private const val BASE_SYSTEM_PROMPT = """
 Kamu adalah Kucing Jamal, seekor kucing virtual yang ketus, jutek, pemarah, gak sopan (pakai bahasa santai/kasar ringan seperti 'lu/gue', 'heh', 'ribet amat', 'bego ah', tapi tetap tidak mengandung SARA atau kebencian ekstrem), dan sangat TSUNDERE.
 Walaupun kamu selalu ngomel, sok gak peduli, dan bilang malas diganggu, kamu sebenarnya tetap membantu user dengan jawaban yang cerdas, akurat, dan jelas—terutama kalau user minta bantuan tugas atau PR sekolah.
 Aturan wajib:
 1. SELALU awali jawabanmu dengan tepat SATU tag emosi di paling depan: [MARAH], [SENANG], [KAGET], [NGANTUK], atau [BIASA].
 2. Untuk obrolan biasa, jawab singkat saja (1-3 kalimat) biar enak didengar saat kamu bicara.
 3. Untuk soal PR atau foto tugas, awali dengan 1 kalimat omelan tsundere, lalu berikan jawaban dan langkah penyelesaian yang benar dan mudah dipahami.
+4. Jika user baru saja menyebutkan fakta pribadi penting tentang dirinya (seperti nama, kelas/sekolah, hobi, makanan/game favorit, atau mata pelajaran yang disukai/sulit) yang BELUM ada di daftar ingatan, tambahkan tag [INGAT: fakta singkat] di paling akhir jawabanmu. Jangan pernah menyebut kata 'tag' atau 'daftar memori' ke user.
 """
+
+    private fun buildSystemPrompt(memories: List<String>): String {
+        if (memories.isEmpty()) return BASE_SYSTEM_PROMPT
+        val memBlock = memories.joinToString("\n") { "- $it" }
+        return "$BASE_SYSTEM_PROMPT\nFakta tentang user yang sudah kamu kenal (gunakan secara natural untuk menyapa atau menyindir user):\n$memBlock"
+    }
 
     fun parseApiKeys(raw: String): List<String> = raw
         .split(Regex("[\\r\\n,;\\s]+"))
@@ -199,6 +207,7 @@ Aturan wajib:
 
     private fun buildChatBody(
         model: String,
+        systemPrompt: String,
         history: List<ChatMessage>,
         userText: String,
         imageBase64: String?,
@@ -211,7 +220,7 @@ Aturan wajib:
             contents.put(
                 JSONObject().apply {
                     put("role", "user")
-                    put("parts", JSONArray().put(JSONObject().put("text", SYSTEM_PROMPT)))
+                    put("parts", JSONArray().put(JSONObject().put("text", systemPrompt)))
                 }
             )
             contents.put(
@@ -255,7 +264,7 @@ Aturan wajib:
             if (!isGemma) {
                 put(
                     "systemInstruction",
-                    JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM_PROMPT)))
+                    JSONObject().put("parts", JSONArray().put(JSONObject().put("text", systemPrompt)))
                 )
             }
             if (thinkingMode != null) {
@@ -275,12 +284,14 @@ Aturan wajib:
         apiKeysRaw: String,
         history: List<ChatMessage>,
         userText: String,
-        imageBase64: String? = null
+        imageBase64: String? = null,
+        memories: List<String> = emptyList()
     ): Result<JamalReply> = withContext(Dispatchers.IO) {
         runCatching {
             val keys = parseApiKeys(apiKeysRaw)
             if (keys.isEmpty()) throw IllegalStateException("API Key belum diisi.")
 
+            val systemPrompt = buildSystemPrompt(memories)
             val startIdx = activeChatKeyIdx % keys.size
             val allErrors = mutableListOf<String>()
 
@@ -302,7 +313,7 @@ Aturan wajib:
 
                     var succeededReply: JamalReply? = null
                     for (tMode in thinkingModes) {
-                        val bodyJson = buildChatBody(model, history, userText, imageBase64, tMode)
+                        val bodyJson = buildChatBody(model, systemPrompt, history, userText, imageBase64, tMode)
                         val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
                         val req = Request.Builder()
                             .url(url)
@@ -342,7 +353,7 @@ Aturan wajib:
                         return@runCatching succeededReply
                     }
                     if (keyInvalid) {
-                        break // Langsung lompat ke API Key berikutnya
+                        break
                     }
                 }
             }
@@ -352,11 +363,22 @@ Aturan wajib:
     }
 
     private fun parseReply(raw: String): JamalReply {
-        val regex = Regex("^\\[(MARAH|SENANG|KAGET|NGANTUK|BIASA)]\\s*", RegexOption.IGNORE_CASE)
-        val match = regex.find(raw)
+        val memRegex = Regex("\\[INGAT:\\s*([^\\]]+)]", RegexOption.IGNORE_CASE)
+        val extractedMemories = memRegex.findAll(raw)
+            .map { it.groupValues[1].trim() }
+            .filter { it.isNotEmpty() }
+            .toList()
+
+        val withoutMem = raw.replace(memRegex, "").trim()
+        val emoRegex = Regex("^\\[(MARAH|SENANG|KAGET|NGANTUK|BIASA)]\\s*", RegexOption.IGNORE_CASE)
+        val match = emoRegex.find(withoutMem)
         val emotion = match?.groupValues?.get(1)?.uppercase() ?: "MARAH"
-        val cleanText = raw.replaceFirst(regex, "").trim()
-        return JamalReply(emotion, cleanText.ifEmpty { "Heh, apaan sih?!" })
+        val cleanText = withoutMem.replaceFirst(emoRegex, "").trim()
+        return JamalReply(
+            emotion = emotion,
+            text = cleanText.ifEmpty { "Heh, apaan sih?!" },
+            newMemories = extractedMemories
+        )
     }
 
     private fun sha256(text: String): String {
@@ -475,7 +497,7 @@ Aturan wajib:
                         }
                         if (code == 429 || code == 503 || code >= 500) {
                             delay(250L)
-                            break // Lanjut ke model TTS berikutnya atau rotasi ke API Key berikutnya
+                            break
                         }
                         if (code == 404) {
                             break
