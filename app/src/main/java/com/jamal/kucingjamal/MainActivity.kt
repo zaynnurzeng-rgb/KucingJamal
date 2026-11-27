@@ -53,6 +53,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -135,7 +136,12 @@ fun KucingJamalScreen() {
     val scope = rememberCoroutineScope()
     val prefs = remember { context.getSharedPreferences("jamal_prefs", Context.MODE_PRIVATE) }
 
-    var apiKey by remember { mutableStateOf(prefs.getString("gemini_api_key", "")?.ifBlank { BuildConfig.GEMINI_API_KEY } ?: BuildConfig.GEMINI_API_KEY) }
+    var apiKey by remember {
+        mutableStateOf(
+            prefs.getString("gemini_api_key", "")?.ifBlank { BuildConfig.GEMINI_API_KEY }
+                ?: BuildConfig.GEMINI_API_KEY
+        )
+    }
     var showSettings by remember { mutableStateOf(false) }
     var showChat by remember { mutableStateOf(false) }
     var chatInput by remember { mutableStateOf("") }
@@ -149,6 +155,7 @@ fun KucingJamalScreen() {
     var isBusy by remember { mutableStateOf(false) }
     var isSpeaking by remember { mutableStateOf(false) }
     var isListening by remember { mutableStateOf(false) }
+    var speechJob by remember { mutableStateOf<Job?>(null) }
 
     val audioPlayer = remember { PcmAudioPlayer() }
     val soundPool = remember {
@@ -180,7 +187,49 @@ fun KucingJamalScreen() {
     var triggerCount by remember { mutableIntStateOf(0) }
     var statusText by remember { mutableStateOf("Heh, mau ngapain lu?!") }
 
-    fun playAnim(anim: JamalAnim, caption: String? = null) {
+    fun stopCurrentSpeech() {
+        speechJob?.cancel()
+        speechJob = null
+        audioPlayer.stop()
+        isSpeaking = false
+    }
+
+    fun speakBubble(
+        text: String,
+        delayMs: Long = 0L,
+        onDone: (() -> Unit)? = null
+    ) {
+        if (apiKey.isBlank() || text.isBlank()) {
+            onDone?.invoke()
+            return
+        }
+        stopCurrentSpeech()
+        speechJob = scope.launch {
+            val res = GeminiClient.synthesizeVoiceCached(context, apiKey.trim(), text)
+            if (delayMs > 0L) delay(delayMs)
+            res.onSuccess { pcm ->
+                isSpeaking = true
+                if (currentAnim == JamalAnim.IDLE || currentAnim == JamalAnim.LISTEN) {
+                    currentAnim = JamalAnim.TALK
+                    triggerCount++
+                }
+                audioPlayer.play(pcm)
+                isSpeaking = false
+                if (currentAnim == JamalAnim.TALK) {
+                    currentAnim = JamalAnim.IDLE
+                }
+                onDone?.invoke()
+            }.onFailure {
+                isSpeaking = false
+                if (currentAnim == JamalAnim.TALK) {
+                    currentAnim = JamalAnim.IDLE
+                }
+                onDone?.invoke()
+            }
+        }
+    }
+
+    fun playAnim(anim: JamalAnim, caption: String? = null, speak: Boolean = true) {
         currentAnim = anim
         triggerCount++
         if (caption != null) statusText = caption
@@ -188,6 +237,18 @@ fun KucingJamalScreen() {
             soundIds[soundName]?.let { id ->
                 soundPool.play(id, 1f, 1f, 1, 0, 1f)
             }
+        }
+        if (speak && caption != null) {
+            // Jeda kecil 350ms agar efek suara klasik terdengar dulu baru Jamal ngomel
+            speakBubble(caption, delayMs = if (anim.sound != null) 350L else 0L)
+        }
+    }
+
+    // Ucapkan sapaan bubble pertama kali saat aplikasi dibuka
+    LaunchedEffect(Unit) {
+        if (apiKey.isNotBlank()) {
+            delay(400L)
+            speakBubble(statusText)
         }
     }
 
@@ -198,45 +259,35 @@ fun KucingJamalScreen() {
             return
         }
         if (isBusy) return
-        audioPlayer.stop()
+        stopCurrentSpeech()
         isBusy = true
         messages = messages + ChatMessage("user", displayPrompt)
         statusText = "Bentar, ribet amat sih..."
         currentAnim = JamalAnim.IDLE
+        speakBubble(statusText)
 
         scope.launch {
             val res = GeminiClient.askJamal(apiKey.trim(), messages.dropLast(1), prompt, imageBase64)
             res.onSuccess { reply ->
                 messages = messages + ChatMessage("model", reply.text)
                 statusText = reply.text
-
-                val ttsRes = GeminiClient.synthesizeVoice(apiKey.trim(), reply.text)
                 isBusy = false
 
-                ttsRes.onSuccess { pcm ->
-                    isSpeaking = true
-                    currentAnim = JamalAnim.TALK
-                    triggerCount++
-                    audioPlayer.play(pcm)
-                    isSpeaking = false
-                }.onFailure { ttsErr ->
-                    isSpeaking = false
-                    statusText = "Teks OK, suara gagal: ${ttsErr.message?.take(120)}"
-                }
-
-                when (reply.emotion) {
-                    "MARAH" -> playAnim(JamalAnim.ANGRY)
-                    "SENANG" -> playAnim(JamalAnim.HAPPY_SHORT)
-                    "KAGET" -> playAnim(JamalAnim.KNOCKOUT)
-                    "NGANTUK" -> playAnim(JamalAnim.YAWN)
-                    else -> currentAnim = JamalAnim.IDLE
+                speakBubble(reply.text) {
+                    when (reply.emotion) {
+                        "MARAH" -> playAnim(JamalAnim.ANGRY, speak = false)
+                        "SENANG" -> playAnim(JamalAnim.HAPPY_SHORT, speak = false)
+                        "KAGET" -> playAnim(JamalAnim.KNOCKOUT, speak = false)
+                        "NGANTUK" -> playAnim(JamalAnim.YAWN, speak = false)
+                        else -> currentAnim = JamalAnim.IDLE
+                    }
                 }
             }.onFailure { err ->
                 isBusy = false
-                val msg = "Gagal konek Gemini: ${err.message?.take(300)}"
-                statusText = msg
-                messages = messages + ChatMessage("model", msg)
-                playAnim(JamalAnim.ANGRY)
+                val shortErr = err.message?.take(220) ?: "Server sibuk"
+                val chatMsg = "Gagal konek Gemini: $shortErr"
+                messages = messages + ChatMessage("model", chatMsg)
+                playAnim(JamalAnim.ANGRY, "Aduh servernya lagi rame banget, coba lagi bentar!")
             }
         }
     }
@@ -251,7 +302,8 @@ fun KucingJamalScreen() {
         speechRecognizer?.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
                 isListening = true
-                playAnim(JamalAnim.LISTEN, "Ngomong cepetan, gue dengerin...")
+                // Saat mic aktif, jangan bicara dulu biar tidak masuk ke mikrofon sendiri
+                playAnim(JamalAnim.LISTEN, "Ngomong cepetan, gue dengerin...", speak = false)
             }
             override fun onBeginningOfSpeech() {}
             override fun onRmsChanged(rmsdB: Float) {}
@@ -259,8 +311,10 @@ fun KucingJamalScreen() {
             override fun onEndOfSpeech() { isListening = false }
             override fun onError(error: Int) {
                 isListening = false
-                statusText = "Gak kedengeran! Ngomong yang jelas dong."
                 currentAnim = JamalAnim.IDLE
+                val msg = "Gak kedengeran! Ngomong yang jelas dong."
+                statusText = msg
+                speakBubble(msg)
             }
             override fun onResults(results: Bundle?) {
                 isListening = false
@@ -277,7 +331,7 @@ fun KucingJamalScreen() {
             override fun onEvent(eventType: Int, params: Bundle?) {}
         })
         onDispose {
-            audioPlayer.stop()
+            stopCurrentSpeech()
             soundPool.release()
             speechRecognizer?.destroy()
         }
@@ -285,10 +339,12 @@ fun KucingJamalScreen() {
 
     fun startVoiceInput() {
         if (speechRecognizer == null) {
-            statusText = "HP ini gak dukung SpeechRecognizer, pakai Chat aja."
+            val msg = "HP ini gak dukung mikrofon otomatis, pakai Chat aja."
+            statusText = msg
+            speakBubble(msg)
             return
         }
-        audioPlayer.stop()
+        stopCurrentSpeech()
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "id-ID")
@@ -300,7 +356,11 @@ fun KucingJamalScreen() {
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) startVoiceInput()
-        else statusText = "Izin mikrofon ditolak, gimana gue mau denger?!"
+        else {
+            val msg = "Izin mikrofon ditolak, gimana gue mau denger?!"
+            statusText = msg
+            speakBubble(msg)
+        }
     }
 
     val photoPicker = rememberLauncherForActivityResult(
@@ -320,8 +380,8 @@ fun KucingJamalScreen() {
         }
     }
 
-    // Engine Animasi ~16 FPS (62ms aksi, 65ms bicara)
-    LaunchedEffect(currentAnim, triggerCount, isSpeaking) {
+    // Engine Animasi ~16 FPS (tanpa me-restart aksi saat isSpeaking berubah)
+    LaunchedEffect(currentAnim, triggerCount) {
         when (currentAnim) {
             JamalAnim.IDLE -> {
                 currentFrame = idleBitmap
@@ -363,7 +423,7 @@ fun KucingJamalScreen() {
                     val dt = System.currentTimeMillis() - t0
                     if (dt < 62L) delay(62L - dt)
                 }
-                currentAnim = JamalAnim.IDLE
+                currentAnim = if (isSpeaking) JamalAnim.TALK else JamalAnim.IDLE
             }
         }
     }
@@ -575,7 +635,7 @@ fun KucingJamalScreen() {
             text = {
                 Column {
                     Text(
-                        "Masukkan API Key dari Google AI Studio. Key disimpan lokal di HP, bukan di GitHub.",
+                        "API Key otomatis terisi dari GitHub Secret. Kamu juga bisa ganti manual di sini.",
                         fontSize = 13.sp
                     )
                     Spacer(Modifier.height(10.dp))
@@ -592,7 +652,9 @@ fun KucingJamalScreen() {
                 TextButton(onClick = {
                     apiKey = tempKey.trim()
                     prefs.edit().putString("gemini_api_key", apiKey).apply()
-                    statusText = "API Key tersimpan! Coba ajak ngobrol sekarang."
+                    val msg = "Yaudah, API Key udah disimpan. Mau nanya apaan cepetan!"
+                    statusText = msg
+                    speakBubble(msg)
                     showSettings = false
                 }) { Text("Simpan") }
             },

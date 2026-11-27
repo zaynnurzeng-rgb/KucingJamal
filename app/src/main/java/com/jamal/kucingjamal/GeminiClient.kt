@@ -1,10 +1,13 @@
 package com.jamal.kucingjamal
 
+import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.util.Base64
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -12,6 +15,8 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 data class ChatMessage(
@@ -26,16 +31,16 @@ data class JamalReply(
 
 object GeminiClient {
     private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(25, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(25, TimeUnit.SECONDS)
         .build()
 
     private val JSON_TYPE = "application/json; charset=utf-8".toMediaType()
 
     @Volatile private var cachedKey: String? = null
-    @Volatile private var cachedChatModel: String? = null
-    @Volatile private var cachedTtsModel: String? = null
+    @Volatile private var chatModels: List<String> = emptyList()
+    @Volatile private var ttsModels: List<String> = emptyList()
 
     private const val SYSTEM_PROMPT = """
 Kamu adalah Kucing Jamal, seekor kucing virtual yang ketus, jutek, pemarah, gak sopan (pakai bahasa santai/kasar ringan seperti 'lu/gue', 'heh', 'ribet amat', 'bego ah', tapi tetap tidak mengandung SARA atau kebencian ekstrem), dan sangat TSUNDERE.
@@ -47,7 +52,7 @@ Aturan wajib:
 """
 
     private fun ensureModels(apiKey: String) {
-        if (cachedKey == apiKey && cachedChatModel != null && cachedTtsModel != null) return
+        if (cachedKey == apiKey && chatModels.isNotEmpty() && ttsModels.isNotEmpty()) return
         cachedKey = apiKey
 
         runCatching {
@@ -87,23 +92,30 @@ Aturan wajib:
                         !m.contains("computer-use")
                 }
 
-                cachedChatModel = chatPool.firstOrNull { it == "gemini-flash-latest" }
-                    ?: chatPool.filter {
-                        it.contains("flash") && !it.contains("lite") && !it.contains("preview") && !it.contains("exp")
-                    }.sortedDescending().firstOrNull()
-                    ?: chatPool.filter { it.contains("flash") && !it.contains("lite") }
-                        .sortedDescending().firstOrNull()
-                    ?: chatPool.filter { it.contains("flash") }
-                        .sortedDescending().firstOrNull()
-                    ?: chatPool.sortedDescending().firstOrNull()
+                val orderedChat = linkedSetOf<String>()
+                chatPool.filter {
+                    it.contains("flash") && !it.contains("lite") && !it.contains("preview") && !it.contains("exp") && !it.contains("latest")
+                }.sortedDescending().forEach { orderedChat.add(it) }
+                if ("gemini-flash-latest" in chatPool) orderedChat.add("gemini-flash-latest")
+                chatPool.filter { it.contains("flash") && it.contains("lite") && !it.contains("preview") }
+                    .sortedDescending().forEach { orderedChat.add(it) }
+                chatPool.filter { it.contains("flash") }
+                    .sortedDescending().forEach { orderedChat.add(it) }
+                chatPool.sortedDescending().forEach { orderedChat.add(it) }
+                chatModels = orderedChat.toList()
 
                 val ttsPool = genModels.filter { it.contains("tts") }
-                cachedTtsModel = ttsPool.filter { it.contains("flash") }
-                    .sortedDescending().firstOrNull()
-                    ?: ttsPool.sortedDescending().firstOrNull()
+                val orderedTts = linkedSetOf<String>()
+                ttsPool.filter { it.contains("flash") }.sortedDescending().forEach { orderedTts.add(it) }
+                ttsPool.sortedDescending().forEach { orderedTts.add(it) }
+                ttsModels = orderedTts.toList()
             }
         }
     }
+
+    private fun extractApiErrorMessage(raw: String): String = runCatching {
+        JSONObject(raw).getJSONObject("error").optString("message", raw)
+    }.getOrDefault(raw)
 
     suspend fun askJamal(
         apiKey: String,
@@ -113,7 +125,9 @@ Aturan wajib:
     ): Result<JamalReply> = withContext(Dispatchers.IO) {
         runCatching {
             ensureModels(apiKey)
-            val model = cachedChatModel ?: "gemini-flash-latest"
+            val candidates = chatModels.take(4).ifEmpty {
+                listOf("gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite")
+            }
 
             val contents = JSONArray()
             history.takeLast(8).forEach { msg ->
@@ -151,33 +165,48 @@ Aturan wajib:
                     JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM_PROMPT)))
                 )
                 put("contents", contents)
-            }
+            }.toString()
 
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
-            val req = Request.Builder()
-                .url(url)
-                .post(bodyJson.toString().toRequestBody(JSON_TYPE))
-                .build()
+            var lastErr = "Server Gemini lagi sibuk."
 
-            client.newCall(req).execute().use { resp ->
-                val raw = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    if (resp.code == 404) cachedChatModel = null
-                    throw IllegalStateException("($model) HTTP ${resp.code}: $raw")
+            for (model in candidates) {
+                for (attempt in 1..2) {
+                    val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+                    val req = Request.Builder()
+                        .url(url)
+                        .post(bodyJson.toRequestBody(JSON_TYPE))
+                        .build()
+
+                    client.newCall(req).execute().use { resp ->
+                        val raw = resp.body?.string().orEmpty()
+                        if (resp.isSuccessful) {
+                            val json = JSONObject(raw)
+                            val parts = json.optJSONArray("candidates")
+                                ?.optJSONObject(0)
+                                ?.optJSONObject("content")
+                                ?.optJSONArray("parts")
+                            val replyRaw = parts?.optJSONObject(0)?.optString("text")?.trim().orEmpty()
+                            return@runCatching if (replyRaw.isEmpty()) {
+                                JamalReply("MARAH", "Heh! Ngomong yang bener dikit kenapa sih, males banget gue jawab beginian!")
+                            } else {
+                                parseReply(replyRaw)
+                            }
+                        }
+
+                        lastErr = "($model) HTTP ${resp.code}: ${extractApiErrorMessage(raw)}"
+                        if (resp.code == 404) {
+                            break // langsung lompat ke model cadangan berikutnya
+                        }
+                        if (resp.code == 503 || resp.code == 429 || resp.code >= 500) {
+                            if (attempt == 1) delay(700L)
+                            else break // coba model cadangan berikutnya
+                        } else {
+                            throw IllegalStateException(lastErr)
+                        }
+                    }
                 }
-                val json = JSONObject(raw)
-                val candidates = json.optJSONArray("candidates")
-                val parts = candidates?.optJSONObject(0)
-                    ?.optJSONObject("content")
-                    ?.optJSONArray("parts")
-                val replyRaw = parts?.optJSONObject(0)?.optString("text")?.trim().orEmpty()
-
-                if (replyRaw.isEmpty()) {
-                    JamalReply("MARAH", "Heh! Ngomong yang bener dikit kenapa sih, males banget gue jawab beginian!")
-                } else {
-                    parseReply(replyRaw)
-                }
             }
+            throw IllegalStateException(lastErr)
         }
     }
 
@@ -189,73 +218,107 @@ Aturan wajib:
         return JamalReply(emotion, cleanText.ifEmpty { "Heh, apaan sih?!" })
     }
 
-    suspend fun synthesizeVoice(apiKey: String, text: String): Result<ByteArray> =
-        withContext(Dispatchers.IO) {
-            runCatching {
-                ensureModels(apiKey)
-                val ttsModel = cachedTtsModel ?: "gemini-2.5-flash-preview-tts"
+    private fun sha256(text: String): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(text.toByteArray())
+        return digest.joinToString("") { "%02x".format(it) }
+    }
 
-                val clean = text
-                    .replace(Regex("[*_#`~]"), "")
-                    .replace(Regex("\\s+"), " ")
-                    .trim()
-                    .take(380)
+    suspend fun synthesizeVoiceCached(
+        context: Context,
+        apiKey: String,
+        text: String
+    ): Result<ByteArray> = withContext(Dispatchers.IO) {
+        runCatching {
+            val clean = text
+                .replace(Regex("[*_#`~]"), "")
+                .replace(Regex("\\s+"), " ")
+                .trim()
+                .take(400)
 
-                val prompt = "Ucapkan kalimat bahasa Indonesia berikut dengan nada ketus, jutek, agak kesal, tapi tsundere seperti kucing pemarah: $clean"
+            if (clean.isBlank()) throw IllegalArgumentException("Teks kosong")
 
-                val bodyJson = JSONObject().apply {
-                    put(
-                        "contents",
-                        JSONArray().put(
-                            JSONObject().put(
-                                "parts",
-                                JSONArray().put(JSONObject().put("text", prompt))
-                            )
+            val cacheDir = File(context.cacheDir, "jamal_tts_v2").apply { mkdirs() }
+            val cacheFile = File(cacheDir, "${sha256(clean)}.pcm")
+            if (cacheFile.exists() && cacheFile.length() > 100L) {
+                return@runCatching cacheFile.readBytes()
+            }
+
+            ensureModels(apiKey)
+            val candidates = ttsModels.take(2).ifEmpty {
+                listOf("gemini-2.5-flash-preview-tts")
+            }
+
+            // Kirim teks murni Jamal saja agar instruksi tidak pernah ikut dibacakan
+            val bodyJson = JSONObject().apply {
+                put(
+                    "contents",
+                    JSONArray().put(
+                        JSONObject().put(
+                            "parts",
+                            JSONArray().put(JSONObject().put("text", clean))
                         )
                     )
-                    put(
-                        "generationConfig",
-                        JSONObject().apply {
-                            put("responseModalities", JSONArray().put("AUDIO"))
-                            put(
-                                "speechConfig",
+                )
+                put(
+                    "generationConfig",
+                    JSONObject().apply {
+                        put("responseModalities", JSONArray().put("AUDIO"))
+                        put(
+                            "speechConfig",
+                            JSONObject().put(
+                                "voiceConfig",
                                 JSONObject().put(
-                                    "voiceConfig",
-                                    JSONObject().put(
-                                        "prebuiltVoiceConfig",
-                                        JSONObject().put("voiceName", "Puck")
-                                    )
+                                    "prebuiltVoiceConfig",
+                                    JSONObject().put("voiceName", "Puck")
                                 )
                             )
-                        }
-                    )
-                }
-
-                val url = "https://generativelanguage.googleapis.com/v1beta/models/$ttsModel:generateContent?key=$apiKey"
-                val req = Request.Builder()
-                    .url(url)
-                    .post(bodyJson.toString().toRequestBody(JSON_TYPE))
-                    .build()
-
-                client.newCall(req).execute().use { resp ->
-                    val raw = resp.body?.string().orEmpty()
-                    if (!resp.isSuccessful) {
-                        if (resp.code == 404) cachedTtsModel = null
-                        throw IllegalStateException("($ttsModel) HTTP ${resp.code}: $raw")
+                        )
                     }
-                    val json = JSONObject(raw)
-                    val b64 = json.getJSONArray("candidates")
-                        .getJSONObject(0)
-                        .getJSONObject("content")
-                        .getJSONArray("parts")
-                        .getJSONObject(0)
-                        .getJSONObject("inlineData")
-                        .getString("data")
+                )
+            }.toString()
 
-                    Base64.decode(b64, Base64.DEFAULT)
+            var lastErr = "Suara Gemini lagi sibuk."
+
+            for (ttsModel in candidates) {
+                for (attempt in 1..2) {
+                    val url = "https://generativelanguage.googleapis.com/v1beta/models/$ttsModel:generateContent?key=$apiKey"
+                    val req = Request.Builder()
+                        .url(url)
+                        .post(bodyJson.toRequestBody(JSON_TYPE))
+                        .build()
+
+                    client.newCall(req).execute().use { resp ->
+                        val raw = resp.body?.string().orEmpty()
+                        if (resp.isSuccessful) {
+                            val json = JSONObject(raw)
+                            val b64 = json.getJSONArray("candidates")
+                                .getJSONObject(0)
+                                .getJSONObject("content")
+                                .getJSONArray("parts")
+                                .getJSONObject(0)
+                                .getJSONObject("inlineData")
+                                .getString("data")
+
+                            val pcm = Base64.decode(b64, Base64.DEFAULT)
+                            runCatching { cacheFile.writeBytes(pcm) }
+                            return@runCatching pcm
+                        }
+
+                        lastErr = "($ttsModel) HTTP ${resp.code}: ${extractApiErrorMessage(raw)}"
+                        if (resp.code == 503 || resp.code == 429 || resp.code >= 500) {
+                            if (attempt == 1) delay(600L)
+                            else break
+                        } else if (resp.code == 404) {
+                            break
+                        } else {
+                            throw IllegalStateException(lastErr)
+                        }
+                    }
                 }
             }
+            throw IllegalStateException(lastErr)
         }
+    }
 }
 
 class PcmAudioPlayer {
@@ -295,18 +358,22 @@ class PcmAudioPlayer {
             track.play()
             var offset = 0
             val chunk = 4096
-            while (offset < pcm24kMono16Bit.size && currentTrack === track) {
+            while (isActive && offset < pcm24kMono16Bit.size && currentTrack === track) {
                 val len = minOf(chunk, pcm24kMono16Bit.size - offset)
                 val written = track.write(pcm24kMono16Bit, offset, len)
                 if (written <= 0) break
                 offset += written
             }
-            if (currentTrack === track) {
+            if (isActive && currentTrack === track) {
                 track.stop()
             }
         } catch (_: Exception) {
         } finally {
-            runCatching { track.release() }
+            runCatching {
+                track.pause()
+                track.flush()
+                track.release()
+            }
             if (currentTrack === track) currentTrack = null
         }
     }
