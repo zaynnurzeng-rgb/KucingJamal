@@ -4,7 +4,17 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val geminiApiKey = System.getenv("GEMINI_API_KEY") ?: ""
+val geminiApiKeys = listOfNotNull(
+    System.getenv("GEMINI_API_KEY"),
+    System.getenv("GEMINI_API_KEY_2"),
+    System.getenv("GEMINI_API_KEY_3")
+).flatMap { it.split(",", "\n", ";") }
+    .map { it.trim() }
+    .filter { it.isNotEmpty() }
+    .distinct()
+    .joinToString(",")
+    .replace("\\", "\\\\")
+    .replace("\"", "\\\"")
 
 android {
     namespace = "com.jamal.kucingjamal"
@@ -16,7 +26,7 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
-        buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKey\"")
+        buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKeys\"")
     }
 
     buildTypes {

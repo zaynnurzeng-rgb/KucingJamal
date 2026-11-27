@@ -136,7 +136,7 @@ fun KucingJamalScreen() {
     val scope = rememberCoroutineScope()
     val prefs = remember { context.getSharedPreferences("jamal_prefs", Context.MODE_PRIVATE) }
 
-    var apiKey by remember {
+    var apiKeysRaw by remember {
         mutableStateOf(
             prefs.getString("gemini_api_key", "")?.ifBlank { BuildConfig.GEMINI_API_KEY }
                 ?: BuildConfig.GEMINI_API_KEY
@@ -156,6 +156,7 @@ fun KucingJamalScreen() {
     var isSpeaking by remember { mutableStateOf(false) }
     var isListening by remember { mutableStateOf(false) }
     var speechJob by remember { mutableStateOf<Job?>(null) }
+    var ttsErrorBanner by remember { mutableStateOf<String?>(null) }
 
     val audioPlayer = remember { PcmAudioPlayer() }
     val soundPool = remember {
@@ -187,6 +188,8 @@ fun KucingJamalScreen() {
     var triggerCount by remember { mutableIntStateOf(0) }
     var statusText by remember { mutableStateOf("Heh, mau ngapain lu?!") }
 
+    fun hasValidKeys(): Boolean = GeminiClient.parseApiKeys(apiKeysRaw).isNotEmpty()
+
     fun stopCurrentSpeech() {
         speechJob?.cancel()
         speechJob = null
@@ -197,19 +200,21 @@ fun KucingJamalScreen() {
     fun speakBubble(
         text: String,
         delayMs: Long = 0L,
+        forceTalkAnim: Boolean = false,
         onDone: (() -> Unit)? = null
     ) {
-        if (apiKey.isBlank() || text.isBlank()) {
+        if (!hasValidKeys() || text.isBlank()) {
             onDone?.invoke()
             return
         }
         stopCurrentSpeech()
         speechJob = scope.launch {
-            val res = GeminiClient.synthesizeVoiceCached(context, apiKey.trim(), text)
+            val res = GeminiClient.synthesizeVoiceCached(context, apiKeysRaw, text)
             if (delayMs > 0L) delay(delayMs)
             res.onSuccess { pcm ->
+                ttsErrorBanner = null
                 isSpeaking = true
-                if (currentAnim == JamalAnim.IDLE || currentAnim == JamalAnim.LISTEN) {
+                if (forceTalkAnim || currentAnim == JamalAnim.IDLE || currentAnim == JamalAnim.LISTEN) {
                     currentAnim = JamalAnim.TALK
                     triggerCount++
                 }
@@ -219,8 +224,9 @@ fun KucingJamalScreen() {
                     currentAnim = JamalAnim.IDLE
                 }
                 onDone?.invoke()
-            }.onFailure {
+            }.onFailure { err ->
                 isSpeaking = false
+                ttsErrorBanner = "Suara Gemini gagal: ${err.message?.take(140)}"
                 if (currentAnim == JamalAnim.TALK) {
                     currentAnim = JamalAnim.IDLE
                 }
@@ -239,21 +245,20 @@ fun KucingJamalScreen() {
             }
         }
         if (speak && caption != null) {
-            // Jeda kecil 350ms agar efek suara klasik terdengar dulu baru Jamal ngomel
             speakBubble(caption, delayMs = if (anim.sound != null) 350L else 0L)
         }
     }
 
-    // Ucapkan sapaan bubble pertama kali saat aplikasi dibuka
+    // Ucapkan sapaan bubble pertama kali saat aplikasi masuk layar utama
     LaunchedEffect(Unit) {
-        if (apiKey.isNotBlank()) {
-            delay(400L)
-            speakBubble(statusText)
+        if (hasValidKeys()) {
+            delay(350L)
+            speakBubble(statusText, forceTalkAnim = true)
         }
     }
 
     fun sendToJamal(prompt: String, imageBase64: String? = null, displayPrompt: String = prompt) {
-        if (apiKey.isBlank()) {
+        if (!hasValidKeys()) {
             statusText = "Isi Gemini API Key dulu di ikon gerigi kanan atas!"
             showSettings = true
             return
@@ -264,16 +269,15 @@ fun KucingJamalScreen() {
         messages = messages + ChatMessage("user", displayPrompt)
         statusText = "Bentar, ribet amat sih..."
         currentAnim = JamalAnim.IDLE
-        speakBubble(statusText)
 
         scope.launch {
-            val res = GeminiClient.askJamal(apiKey.trim(), messages.dropLast(1), prompt, imageBase64)
+            val res = GeminiClient.askJamal(apiKeysRaw, messages.dropLast(1), prompt, imageBase64)
             res.onSuccess { reply ->
                 messages = messages + ChatMessage("model", reply.text)
                 statusText = reply.text
                 isBusy = false
 
-                speakBubble(reply.text) {
+                speakBubble(reply.text, forceTalkAnim = true) {
                     when (reply.emotion) {
                         "MARAH" -> playAnim(JamalAnim.ANGRY, speak = false)
                         "SENANG" -> playAnim(JamalAnim.HAPPY_SHORT, speak = false)
@@ -284,7 +288,7 @@ fun KucingJamalScreen() {
                 }
             }.onFailure { err ->
                 isBusy = false
-                val shortErr = err.message?.take(220) ?: "Server sibuk"
+                val shortErr = err.message?.take(240) ?: "Server sibuk"
                 val chatMsg = "Gagal konek Gemini: $shortErr"
                 messages = messages + ChatMessage("model", chatMsg)
                 playAnim(JamalAnim.ANGRY, "Aduh servernya lagi rame banget, coba lagi bentar!")
@@ -302,7 +306,6 @@ fun KucingJamalScreen() {
         speechRecognizer?.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
                 isListening = true
-                // Saat mic aktif, jangan bicara dulu biar tidak masuk ke mikrofon sendiri
                 playAnim(JamalAnim.LISTEN, "Ngomong cepetan, gue dengerin...", speak = false)
             }
             override fun onBeginningOfSpeech() {}
@@ -314,7 +317,7 @@ fun KucingJamalScreen() {
                 currentAnim = JamalAnim.IDLE
                 val msg = "Gak kedengeran! Ngomong yang jelas dong."
                 statusText = msg
-                speakBubble(msg)
+                speakBubble(msg, forceTalkAnim = true)
             }
             override fun onResults(results: Bundle?) {
                 isListening = false
@@ -341,7 +344,7 @@ fun KucingJamalScreen() {
         if (speechRecognizer == null) {
             val msg = "HP ini gak dukung mikrofon otomatis, pakai Chat aja."
             statusText = msg
-            speakBubble(msg)
+            speakBubble(msg, forceTalkAnim = true)
             return
         }
         stopCurrentSpeech()
@@ -359,7 +362,7 @@ fun KucingJamalScreen() {
         else {
             val msg = "Izin mikrofon ditolak, gimana gue mau denger?!"
             statusText = msg
-            speakBubble(msg)
+            speakBubble(msg, forceTalkAnim = true)
         }
     }
 
@@ -380,7 +383,7 @@ fun KucingJamalScreen() {
         }
     }
 
-    // Engine Animasi ~16 FPS (tanpa me-restart aksi saat isSpeaking berubah)
+    // Engine Animasi ~16 FPS
     LaunchedEffect(currentAnim, triggerCount) {
         when (currentAnim) {
             JamalAnim.IDLE -> {
@@ -456,40 +459,64 @@ fun KucingJamalScreen() {
             )
         }
 
-        // Layer 2: Status Bubble + Tombol Pengaturan API Key
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
+        // Layer 2: Status Bubble + Tombol Pengaturan + Info Error TTS (jika gagal)
+        Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
                 .statusBarsPadding()
                 .padding(top = 10.dp, start = 14.dp, end = 14.dp)
         ) {
-            Surface(
-                color = Color.Black.copy(alpha = 0.62f),
-                shape = RoundedCornerShape(20.dp),
-                modifier = Modifier
-                    .weight(1f)
-                    .clickable { showChat = true }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Text(
-                    text = statusText,
-                    color = Color.White,
-                    fontSize = 13.sp,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
-                )
+                Surface(
+                    color = Color.Black.copy(alpha = 0.62f),
+                    shape = RoundedCornerShape(20.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable { showChat = true }
+                ) {
+                    Text(
+                        text = statusText,
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+                IconButton(
+                    onClick = { showSettings = true },
+                    modifier = Modifier
+                        .size(42.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.62f))
+                ) {
+                    Icon(Icons.Filled.Settings, contentDescription = "API Key", tint = Color.White)
+                }
             }
-            Spacer(Modifier.width(8.dp))
-            IconButton(
-                onClick = { showSettings = true },
-                modifier = Modifier
-                    .size(42.dp)
-                    .clip(CircleShape)
-                    .background(Color.Black.copy(alpha = 0.62f))
-            ) {
-                Icon(Icons.Filled.Settings, contentDescription = "API Key", tint = Color.White)
+
+            ttsErrorBanner?.let { errText ->
+                Spacer(Modifier.height(6.dp))
+                Surface(
+                    color = Color(0xCCB71C1C),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { ttsErrorBanner = null }
+                ) {
+                    Text(
+                        text = errText,
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                    )
+                }
             }
         }
 
@@ -626,35 +653,67 @@ fun KucingJamalScreen() {
         }
     }
 
-    // Dialog Pengaturan Gemini API Key
+    // Dialog Pengaturan Multi API Key
     if (showSettings) {
-        var tempKey by remember { mutableStateOf(apiKey) }
+        var tempKeys by remember {
+            mutableStateOf(GeminiClient.parseApiKeys(apiKeysRaw).joinToString("\n"))
+        }
+        val detectedCount = GeminiClient.parseApiKeys(tempKeys).size
+
         AlertDialog(
             onDismissRequest = { showSettings = false },
-            title = { Text("Pengaturan Gemini API Key") },
+            title = { Text("Rotasi Multi API Key") },
             text = {
                 Column {
                     Text(
-                        "API Key otomatis terisi dari GitHub Secret. Kamu juga bisa ganti manual di sini.",
-                        fontSize = 13.sp
+                        "Masukkan 1 atau beberapa Gemini API Key (1 key per baris, dari Project/akun berbeda). Otomatis pindah saat kuota habis.",
+                        fontSize = 12.sp
                     )
-                    Spacer(Modifier.height(10.dp))
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = GeminiClient.getRotationStatus(apiKeysRaw),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFF1E88E5)
+                    )
+                    Spacer(Modifier.height(8.dp))
                     OutlinedTextField(
-                        value = tempKey,
-                        onValueChange = { tempKey = it },
-                        label = { Text("AIza...") },
-                        singleLine = true,
+                        value = tempKeys,
+                        onValueChange = { tempKeys = it },
+                        label = { Text("AIza... (terdeteksi $detectedCount key)") },
+                        minLines = 3,
+                        maxLines = 6,
                         modifier = Modifier.fillMaxWidth()
                     )
+                    if (BuildConfig.GEMINI_API_KEY.isNotBlank()) {
+                        Spacer(Modifier.height(6.dp))
+                        TextButton(
+                            onClick = {
+                                tempKeys = GeminiClient.parseApiKeys(BuildConfig.GEMINI_API_KEY)
+                                    .joinToString("\n")
+                            },
+                            contentPadding = PaddingValues(0.dp)
+                        ) {
+                            Text("Muat ulang dari GitHub Secret", fontSize = 12.sp)
+                        }
+                    }
                 }
             },
             confirmButton = {
                 TextButton(onClick = {
-                    apiKey = tempKey.trim()
-                    prefs.edit().putString("gemini_api_key", apiKey).apply()
-                    val msg = "Yaudah, API Key udah disimpan. Mau nanya apaan cepetan!"
+                    val normalized = GeminiClient.parseApiKeys(tempKeys).joinToString("\n")
+                    apiKeysRaw = normalized
+                    GeminiClient.resetKeyRotation()
+                    prefs.edit().putString("gemini_api_key", normalized).apply()
+                    ttsErrorBanner = null
+                    val count = GeminiClient.parseApiKeys(normalized).size
+                    val msg = if (count > 1) {
+                        "Oke, $count API Key cadangan udah dipasang. Aman nih buat ngoceh!"
+                    } else {
+                        "Yaudah, API Key udah disimpan. Mau nanya apaan cepetan!"
+                    }
                     statusText = msg
-                    speakBubble(msg)
+                    speakBubble(msg, forceTalkAnim = true)
                     showSettings = false
                 }) { Text("Simpan") }
             },
