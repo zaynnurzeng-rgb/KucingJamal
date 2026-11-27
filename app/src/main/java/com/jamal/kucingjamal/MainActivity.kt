@@ -6,7 +6,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.media.AudioAttributes
+import android.media.ExifInterface
 import android.media.SoundPool
 import android.net.Uri
 import android.os.Bundle
@@ -22,10 +24,12 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -33,8 +37,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Chat
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -52,13 +59,17 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.util.Locale
+import kotlin.math.hypot
 
 enum class JamalAnim(val folder: String, val frames: Int, val sound: String? = null) {
     IDLE("idle", 1),
@@ -80,6 +91,11 @@ enum class JamalAnim(val folder: String, val frames: Int, val sound: String? = n
     STOMACH("stomach", 32, "p_belly1.wav"),
     YAWN("yawn", 29, "p_yawn2_11a.wav")
 }
+
+private data class PreparedPrPhoto(
+    val preview: ImageBitmap,
+    val base64: String
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -108,25 +124,48 @@ private fun loadUiIcon(context: Context, fileName: String): ImageBitmap? = runCa
     }
 }.getOrNull()
 
-private fun uriToBase64Jpeg(context: Context, uri: Uri): String? = runCatching {
-    context.contentResolver.openInputStream(uri)?.use { input ->
-        val orig = BitmapFactory.decodeStream(input) ?: return null
-        val maxSide = 1024
-        val scale = minOf(1f, maxSide.toFloat() / maxOf(orig.width, orig.height))
-        val bmp = if (scale < 1f) {
-            Bitmap.createScaledBitmap(
-                orig,
-                (orig.width * scale).toInt(),
-                (orig.height * scale).toInt(),
-                true
-            )
-        } else {
-            orig
-        }
-        val out = ByteArrayOutputStream()
-        bmp.compress(Bitmap.CompressFormat.JPEG, 82, out)
-        Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+private fun preparePrPhotoFromUri(context: Context, uri: Uri): PreparedPrPhoto? = runCatching {
+    val rawBytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        ?: return null
+
+    val orientation = runCatching {
+        ExifInterface(ByteArrayInputStream(rawBytes)).getAttributeInt(
+            ExifInterface.TAG_ORIENTATION,
+            ExifInterface.ORIENTATION_NORMAL
+        )
+    }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+
+    val orig = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size) ?: return null
+    val maxSide = 1280
+    val scale = minOf(1f, maxSide.toFloat() / maxOf(orig.width, orig.height))
+    val scaled = if (scale < 1f) {
+        Bitmap.createScaledBitmap(
+            orig,
+            (orig.width * scale).toInt(),
+            (orig.height * scale).toInt(),
+            true
+        )
+    } else {
+        orig
     }
+
+    val matrix = Matrix().apply {
+        when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> postRotate(90f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> postRotate(180f)
+            ExifInterface.ORIENTATION_ROTATE_270 -> postRotate(270f)
+        }
+    }
+    val finalBmp = if (!matrix.isIdentity) {
+        Bitmap.createBitmap(scaled, 0, 0, scaled.width, scaled.height, matrix, true)
+    } else {
+        scaled
+    }
+
+    val out = ByteArrayOutputStream()
+    finalBmp.compress(Bitmap.CompressFormat.JPEG, 84, out)
+    val b64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+    PreparedPrPhoto(preview = finalBmp.asImageBitmap(), base64 = b64)
 }.getOrNull()
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -144,19 +183,28 @@ fun KucingJamalScreen() {
     }
     var showSettings by remember { mutableStateOf(false) }
     var showChat by remember { mutableStateOf(false) }
+    var showClearConfirm by remember { mutableStateOf(false) }
+    var showPhotoSourceDialog by remember { mutableStateOf(false) }
+    var pendingPrPhoto by remember { mutableStateOf<PreparedPrPhoto?>(null) }
+    var prNoteInput by remember { mutableStateOf("") }
+    var cameraPhotoUri by remember { mutableStateOf<Uri?>(null) }
+
     var chatInput by remember { mutableStateOf("") }
-    var messages by remember {
-        mutableStateOf(
-            listOf(
-                ChatMessage("model", "Heh, ngapain buka-buka aplikasi ini? Kalau mau nanya PR atau ngobrol cepetan, gue sibuk!")
-            )
-        )
-    }
+    var messages by remember { mutableStateOf(ChatStorage.load(context)) }
     var isBusy by remember { mutableStateOf(false) }
     var isSpeaking by remember { mutableStateOf(false) }
     var isListening by remember { mutableStateOf(false) }
     var speechJob by remember { mutableStateOf<Job?>(null) }
     var ttsErrorBanner by remember { mutableStateOf<String?>(null) }
+    var lastInteractionAt by remember { mutableLongStateOf(System.currentTimeMillis()) }
+
+    val petLines = remember {
+        listOf(
+            "Hmph! Jangan elus-elus, bukan berarti gue suka ya!",
+            "Ih apaan sih pegang-pegang... eh bentar, lanjut dikit boleh deh.",
+            "Ck, sok akrab banget ngelus-ngelus gue!"
+        )
+    }
 
     val audioPlayer = remember { PcmAudioPlayer() }
     val soundPool = remember {
@@ -188,7 +236,18 @@ fun KucingJamalScreen() {
     var triggerCount by remember { mutableIntStateOf(0) }
     var statusText by remember { mutableStateOf("Heh, mau ngapain lu?!") }
 
+    // Simpan riwayat obrolan secara permanen tiap ada perubahan
+    LaunchedEffect(messages) {
+        withContext(Dispatchers.IO) {
+            ChatStorage.save(context, messages)
+        }
+    }
+
     fun hasValidKeys(): Boolean = GeminiClient.parseApiKeys(apiKeysRaw).isNotEmpty()
+
+    fun markActive() {
+        lastInteractionAt = System.currentTimeMillis()
+    }
 
     fun stopCurrentSpeech() {
         speechJob?.cancel()
@@ -220,6 +279,7 @@ fun KucingJamalScreen() {
                 }
                 audioPlayer.play(pcm)
                 isSpeaking = false
+                markActive()
                 if (currentAnim == JamalAnim.TALK) {
                     currentAnim = JamalAnim.IDLE
                 }
@@ -236,6 +296,7 @@ fun KucingJamalScreen() {
     }
 
     fun playAnim(anim: JamalAnim, caption: String? = null, speak: Boolean = true) {
+        markActive()
         currentAnim = anim
         triggerCount++
         if (caption != null) statusText = caption
@@ -251,6 +312,7 @@ fun KucingJamalScreen() {
 
     // Ucapkan sapaan bubble pertama kali saat aplikasi masuk layar utama
     LaunchedEffect(Unit) {
+        markActive()
         if (hasValidKeys()) {
             delay(350L)
             speakBubble(statusText, forceTalkAnim = true)
@@ -258,6 +320,7 @@ fun KucingJamalScreen() {
     }
 
     fun sendToJamal(prompt: String, imageBase64: String? = null, displayPrompt: String = prompt) {
+        markActive()
         if (!hasValidKeys()) {
             statusText = "Isi Gemini API Key dulu di ikon gerigi kanan atas!"
             showSettings = true
@@ -276,6 +339,7 @@ fun KucingJamalScreen() {
                 messages = messages + ChatMessage("model", reply.text)
                 statusText = reply.text
                 isBusy = false
+                markActive()
 
                 speakBubble(reply.text, forceTalkAnim = true) {
                     when (reply.emotion) {
@@ -292,6 +356,19 @@ fun KucingJamalScreen() {
                 val chatMsg = "Gagal konek Gemini: $shortErr"
                 messages = messages + ChatMessage("model", chatMsg)
                 playAnim(JamalAnim.ANGRY, "Aduh servernya lagi rame banget, coba lagi bentar!")
+            }
+        }
+    }
+
+    fun loadPrImageForPreview(uri: Uri) {
+        markActive()
+        scope.launch {
+            val prepared = withContext(Dispatchers.IO) { preparePrPhotoFromUri(context, uri) }
+            if (prepared != null) {
+                prNoteInput = ""
+                pendingPrPhoto = prepared
+            } else {
+                statusText = "Gagal baca fotonya, coba foto ulang deh."
             }
         }
     }
@@ -341,6 +418,7 @@ fun KucingJamalScreen() {
     }
 
     fun startVoiceInput() {
+        markActive()
         if (speechRecognizer == null) {
             val msg = "HP ini gak dukung mikrofon otomatis, pakai Chat aja."
             statusText = msg
@@ -369,30 +447,75 @@ fun KucingJamalScreen() {
     val photoPicker = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
-        if (uri != null) {
-            scope.launch {
-                val b64 = withContext(Dispatchers.IO) { uriToBase64Jpeg(context, uri) }
-                if (b64 != null) {
-                    sendToJamal(
-                        prompt = "Tolong kerjakan dan jelaskan soal PR yang ada di gambar ini dengan jelas.",
-                        imageBase64 = b64,
-                        displayPrompt = "[Foto Soal PR dikirim]"
-                    )
-                }
-            }
+        if (uri != null) loadPrImageForPreview(uri)
+    }
+
+    val cameraLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.TakePicture()
+    ) { success ->
+        val uri = cameraPhotoUri
+        if (success && uri != null) {
+            loadPrImageForPreview(uri)
         }
     }
 
-    // Engine Animasi ~16 FPS
+    fun launchCameraForPr() {
+        markActive()
+        runCatching {
+            val dir = File(context.cacheDir, "pr_photos").apply { mkdirs() }
+            val photoFile = File(dir, "pr_${System.currentTimeMillis()}.jpg")
+            val uri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                photoFile
+            )
+            cameraPhotoUri = uri
+            cameraLauncher.launch(uri)
+        }.onFailure {
+            statusText = "Gagal buka kamera: ${it.message?.take(60)}"
+        }
+    }
+
+    val cameraPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) launchCameraForPr()
+        else {
+            val msg = "Izin kamera ditolak, gimana mau foto soal PR?!"
+            statusText = msg
+            speakBubble(msg, forceTalkAnim = true)
+        }
+    }
+
+    // Engine Animasi ~16 FPS + Perilaku Idle Otomatis (Menguap / Bersin > 20 detik)
     LaunchedEffect(currentAnim, triggerCount) {
         when (currentAnim) {
             JamalAnim.IDLE -> {
                 currentFrame = idleBitmap
                 while (true) {
-                    delay((2800L..5200L).random())
+                    delay((2800L..4800L).random())
                     currentFrame = blinkBitmap
                     delay(130L)
                     currentFrame = idleBitmap
+
+                    val idleMs = System.currentTimeMillis() - lastInteractionAt
+                    val overlayOpen = showChat || showSettings || showPhotoSourceDialog || pendingPrPhoto != null
+                    if (idleMs >= 20_000L && !isBusy && !isSpeaking && !isListening && !overlayOpen) {
+                        if ((0..1).random() == 0) {
+                            playAnim(
+                                JamalAnim.YAWN,
+                                "Hooaam... ngantuk gue dicuekin mulu.",
+                                speak = false
+                            )
+                        } else {
+                            playAnim(
+                                JamalAnim.SNEEZE,
+                                "Hatsyi! Pasti lu lagi ngomongin gue ya?!",
+                                speak = false
+                            )
+                        }
+                        break
+                    }
                 }
             }
             JamalAnim.LISTEN -> {
@@ -426,6 +549,7 @@ fun KucingJamalScreen() {
                     val dt = System.currentTimeMillis() - t0
                     if (dt < 62L) delay(62L - dt)
                 }
+                markActive()
                 currentAnim = if (isSpeaking) JamalAnim.TALK else JamalAnim.IDLE
             }
         }
@@ -436,7 +560,7 @@ fun KucingJamalScreen() {
             .fillMaxSize()
             .background(Color.Black)
     ) {
-        // Layer 1: Kucing Jamal Full-Screen + Zona Sentuh
+        // Layer 1: Kucing Jamal Full-Screen + Zona Sentuh (Tap) & Elus (Swipe)
         currentFrame?.let { bmp ->
             Image(
                 bitmap = bmp,
@@ -445,21 +569,62 @@ fun KucingJamalScreen() {
                 modifier = Modifier
                     .fillMaxSize()
                     .pointerInput(Unit) {
-                        detectTapGestures { offset ->
-                            val nx = offset.x / size.width.toFloat()
-                            val ny = offset.y / size.height.toFloat()
-                            when {
-                                ny in 0.14f..0.46f -> playAnim(JamalAnim.KNOCKOUT, "Woi! Jangan pukul kepala gue!")
-                                ny in 0.46f..0.72f -> playAnim(JamalAnim.STOMACH, "Ih apaan sih colek-colek perut!")
-                                ny > 0.72f && nx < 0.5f -> playAnim(JamalAnim.FOOT_RIGHT, "Aw! Kaki kanan gue sakit tau!")
-                                ny > 0.72f && nx >= 0.5f -> playAnim(JamalAnim.FOOT_LEFT, "Heh! Jangan injek kaki kiri!")
+                        val touchSlop = viewConfiguration.touchSlop
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            val startPos = down.position
+                            var lastPos = startPos
+                            var totalDrag = 0f
+                            var petTriggered = false
+
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                if (!change.pressed) {
+                                    if (!petTriggered && totalDrag < touchSlop) {
+                                        val nx = startPos.x / size.width.toFloat()
+                                        val ny = startPos.y / size.height.toFloat()
+                                        when {
+                                            ny in 0.14f..0.46f -> playAnim(
+                                                JamalAnim.KNOCKOUT,
+                                                "Woi! Jangan pukul kepala gue!"
+                                            )
+                                            ny in 0.46f..0.72f -> playAnim(
+                                                JamalAnim.STOMACH,
+                                                "Ih apaan sih colek-colek perut!"
+                                            )
+                                            ny > 0.72f && nx < 0.5f -> playAnim(
+                                                JamalAnim.FOOT_RIGHT,
+                                                "Aw! Kaki kanan gue sakit tau!"
+                                            )
+                                            ny > 0.72f && nx >= 0.5f -> playAnim(
+                                                JamalAnim.FOOT_LEFT,
+                                                "Heh! Jangan injek kaki kiri!"
+                                            )
+                                        }
+                                    }
+                                    break
+                                }
+
+                                val dx = change.position.x - lastPos.x
+                                val dy = change.position.y - lastPos.y
+                                totalDrag += hypot(dx, dy)
+                                lastPos = change.position
+
+                                if (!petTriggered && totalDrag > maxOf(touchSlop * 2.5f, 55f)) {
+                                    val ny = startPos.y / size.height.toFloat()
+                                    if (ny in 0.14f..0.72f) {
+                                        petTriggered = true
+                                        playAnim(JamalAnim.HAPPY_SHORT, petLines.random())
+                                    }
+                                }
                             }
                         }
                     }
             )
         }
 
-        // Layer 2: Status Bubble + Tombol Pengaturan + Info Error TTS (jika gagal)
+        // Layer 2: Status Bubble + Tombol Stop Bicara + Tombol Pengaturan + Info Error TTS
         Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
@@ -476,7 +641,10 @@ fun KucingJamalScreen() {
                     shape = RoundedCornerShape(20.dp),
                     modifier = Modifier
                         .weight(1f)
-                        .clickable { showChat = true }
+                        .clickable {
+                            markActive()
+                            showChat = true
+                        }
                 ) {
                     Text(
                         text = statusText,
@@ -487,9 +655,35 @@ fun KucingJamalScreen() {
                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
                     )
                 }
+
+                if (isSpeaking) {
+                    Spacer(Modifier.width(8.dp))
+                    IconButton(
+                        onClick = {
+                            markActive()
+                            stopCurrentSpeech()
+                            currentAnim = JamalAnim.IDLE
+                            statusText = "Iya iya, gue diem deh!"
+                        },
+                        modifier = Modifier
+                            .size(42.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xD9D32F2F))
+                    ) {
+                        Icon(
+                            Icons.Filled.VolumeOff,
+                            contentDescription = "Stop Bicara",
+                            tint = Color.White
+                        )
+                    }
+                }
+
                 Spacer(Modifier.width(8.dp))
                 IconButton(
-                    onClick = { showSettings = true },
+                    onClick = {
+                        markActive()
+                        showSettings = true
+                    },
                     modifier = Modifier
                         .size(42.dp)
                         .clip(CircleShape)
@@ -558,7 +752,8 @@ fun KucingJamalScreen() {
                 label = "Foto PR",
                 bg = Color(0xFF1E88E5)
             ) {
-                photoPicker.launch("image/*")
+                markActive()
+                showPhotoSourceDialog = true
             }
             AiActionButton(
                 icon = Icons.Filled.Mic,
@@ -566,6 +761,7 @@ fun KucingJamalScreen() {
                 bg = if (isListening) Color(0xFFE53935) else Color(0xFF43A047),
                 big = true
             ) {
+                markActive()
                 val hasPerm = ContextCompat.checkSelfPermission(
                     context, Manifest.permission.RECORD_AUDIO
                 ) == PackageManager.PERMISSION_GRANTED
@@ -577,27 +773,166 @@ fun KucingJamalScreen() {
                 label = "Chat",
                 bg = Color(0xFFFB8C00)
             ) {
+                markActive()
                 showChat = true
             }
         }
     }
 
-    // Panel Chat & Jawaban PR (Bottom Sheet)
+    // Dialog Pilih Sumber Foto PR (Kamera Langsung vs Galeri)
+    if (showPhotoSourceDialog) {
+        AlertDialog(
+            onDismissRequest = { showPhotoSourceDialog = false },
+            title = { Text("Kirim Soal PR") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "Pilih mau foto langsung soalnya atau ambil dari galeri:",
+                        fontSize = 13.sp
+                    )
+                    Button(
+                        onClick = {
+                            showPhotoSourceDialog = false
+                            val hasCam = ContextCompat.checkSelfPermission(
+                                context, Manifest.permission.CAMERA
+                            ) == PackageManager.PERMISSION_GRANTED
+                            if (hasCam) launchCameraForPr()
+                            else cameraPermLauncher.launch(Manifest.permission.CAMERA)
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Filled.CameraAlt, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Foto Langsung (Kamera)")
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            showPhotoSourceDialog = false
+                            photoPicker.launch("image/*")
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Filled.PhotoLibrary, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Pilih dari Galeri")
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showPhotoSourceDialog = false }) { Text("Batal") }
+            }
+        )
+    }
+
+    // Dialog Pratinjau Foto PR + Catatan Tambahan Sebelum Dikirim
+    pendingPrPhoto?.let { photo ->
+        AlertDialog(
+            onDismissRequest = { pendingPrPhoto = null },
+            title = { Text("Pratinjau Soal PR") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Image(
+                        bitmap = photo.preview,
+                        contentDescription = "Pratinjau Foto PR",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 220.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color(0xFF1E1E1E))
+                    )
+                    OutlinedTextField(
+                        value = prNoteInput,
+                        onValueChange = { prNoteInput = it },
+                        label = { Text("Catatan tambahan (opsional)") },
+                        placeholder = { Text("Misal: kerjakan nomor 3 aja") },
+                        maxLines = 3,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    val note = prNoteInput.trim()
+                    val promptText = if (note.isEmpty()) {
+                        "Tolong kerjakan dan jelaskan soal PR yang ada di gambar ini dengan jelas."
+                    } else {
+                        "Tolong kerjakan dan jelaskan soal PR di gambar ini dengan jelas. Catatan tambahan: $note"
+                    }
+                    val displayText = if (note.isEmpty()) {
+                        "[Foto Soal PR dikirim]"
+                    } else {
+                        "[Foto Soal PR] $note"
+                    }
+                    val b64 = photo.base64
+                    pendingPrPhoto = null
+                    prNoteInput = ""
+                    sendToJamal(prompt = promptText, imageBase64 = b64, displayPrompt = displayText)
+                }) {
+                    Text("Kirim ke Jamal")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingPrPhoto = null }) { Text("Batal") }
+            }
+        )
+    }
+
+    // Panel Chat & Jawaban PR (Bottom Sheet + Riwayat Permanen + Hapus Riwayat)
     if (showChat) {
+        val listState = rememberLazyListState()
+        LaunchedEffect(messages.size, showChat) {
+            if (messages.isNotEmpty()) {
+                listState.animateScrollToItem(messages.lastIndex)
+            }
+        }
+
         ModalBottomSheet(onDismissRequest = { showChat = false }) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .fillMaxHeight(0.75f)
+                    .fillMaxHeight(0.78f)
                     .padding(horizontal = 16.dp)
             ) {
-                Text(
-                    "Obrolan & PR bareng Kucing Jamal",
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 16.sp,
-                    modifier = Modifier.padding(bottom = 8.dp)
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp)
+                ) {
+                    Text(
+                        "Obrolan & PR bareng Kucing Jamal",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (isSpeaking) {
+                            IconButton(onClick = {
+                                stopCurrentSpeech()
+                                currentAnim = JamalAnim.IDLE
+                                statusText = "Iya iya, gue diem deh!"
+                            }) {
+                                Icon(
+                                    Icons.Filled.VolumeOff,
+                                    contentDescription = "Stop Bicara",
+                                    tint = Color(0xFFD32F2F)
+                                )
+                            }
+                        }
+                        IconButton(onClick = { showClearConfirm = true }) {
+                            Icon(
+                                Icons.Filled.Delete,
+                                contentDescription = "Hapus Riwayat",
+                                tint = Color(0xFF757575)
+                            )
+                        }
+                    }
+                }
+
                 LazyColumn(
+                    state = listState,
                     modifier = Modifier.weight(1f),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
@@ -624,6 +959,7 @@ fun KucingJamalScreen() {
                         }
                     }
                 }
+
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
@@ -651,6 +987,27 @@ fun KucingJamalScreen() {
                 }
             }
         }
+    }
+
+    // Konfirmasi Hapus Riwayat Chat
+    if (showClearConfirm) {
+        AlertDialog(
+            onDismissRequest = { showClearConfirm = false },
+            title = { Text("Hapus Semua Riwayat Chat?") },
+            text = { Text("Semua riwayat obrolan dan jawaban PR sebelumnya bakal dihapus permanen dari HP.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    messages = ChatStorage.clear(context)
+                    statusText = "Riwayat chat udah gue bersihin. Mulai dari nol lagi deh!"
+                    showClearConfirm = false
+                }) {
+                    Text("Hapus", color = Color(0xFFD32F2F))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearConfirm = false }) { Text("Batal") }
+            }
+        )
     }
 
     // Dialog Pengaturan Multi API Key
