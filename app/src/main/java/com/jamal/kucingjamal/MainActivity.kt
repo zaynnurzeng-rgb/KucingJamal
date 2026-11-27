@@ -135,7 +135,7 @@ fun KucingJamalScreen() {
     val scope = rememberCoroutineScope()
     val prefs = remember { context.getSharedPreferences("jamal_prefs", Context.MODE_PRIVATE) }
 
-    var apiKey by remember { mutableStateOf(prefs.getString("gemini_api_key", "") ?: "") }
+    var apiKey by remember { mutableStateOf(prefs.getString("gemini_api_key", "")?.ifBlank { BuildConfig.GEMINI_API_KEY } ?: BuildConfig.GEMINI_API_KEY) }
     var showSettings by remember { mutableStateOf(false) }
     var showChat by remember { mutableStateOf(false) }
     var chatInput by remember { mutableStateOf("") }
