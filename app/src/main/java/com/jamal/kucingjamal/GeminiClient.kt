@@ -38,8 +38,14 @@ object GeminiClient {
 
     private val JSON_TYPE = "application/json; charset=utf-8".toMediaType()
 
-    @Volatile private var cachedKey: String? = null
-    @Volatile private var chatModels: List<String> = emptyList()
+    private val CHAT_FALLBACK_CHAIN = listOf(
+        "gemini-3.5-flash-lite",
+        "gemini-3.6-flash",
+        "gemma-4-31b-a4b-it"
+    )
+
+    @Volatile private var cachedCatalogKey: String? = null
+    @Volatile private var hydrogenModels: List<String> = emptyList()
     @Volatile private var ttsModels: List<String> = emptyList()
 
     private const val SYSTEM_PROMPT = """
@@ -51,9 +57,9 @@ Aturan wajib:
 3. Untuk soal PR atau foto tugas, awali dengan 1 kalimat omelan tsundere, lalu berikan jawaban dan langkah penyelesaian yang benar dan mudah dipahami.
 """
 
-    private fun ensureModels(apiKey: String) {
-        if (cachedKey == apiKey && chatModels.isNotEmpty() && ttsModels.isNotEmpty()) return
-        cachedKey = apiKey
+    private fun ensureModelCatalog(apiKey: String) {
+        if (cachedCatalogKey == apiKey && (hydrogenModels.isNotEmpty() || ttsModels.isNotEmpty())) return
+        cachedCatalogKey = apiKey
 
         runCatching {
             val req = Request.Builder()
@@ -67,7 +73,8 @@ Aturan wajib:
             if (!isOk) return
 
             val arr = JSONObject(bodyStr).optJSONArray("models") ?: return
-            val genModels = mutableListOf<String>()
+            val hydroPool = mutableListOf<String>()
+            val ttsPool = mutableListOf<String>()
 
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
@@ -80,36 +87,28 @@ Aturan wajib:
                         break
                     }
                 }
-                if (canGen && name.startsWith("gemini-")) {
-                    genModels.add(name)
+                if (!canGen) continue
+
+                val lower = name.lowercase()
+                if (lower.contains("tts")) {
+                    ttsPool.add(name)
+                } else if (
+                    lower.contains("hydrogen") &&
+                    !lower.contains("image") &&
+                    !lower.contains("embedding") &&
+                    !lower.contains("audio") &&
+                    !lower.contains("live")
+                ) {
+                    hydroPool.add(name)
                 }
             }
 
-            val chatPool = genModels.filter { m ->
-                !m.contains("tts") &&
-                    !m.contains("image") &&
-                    !m.contains("embedding") &&
-                    !m.contains("audio") &&
-                    !m.contains("live") &&
-                    !m.contains("robotics") &&
-                    !m.contains("computer-use")
-            }
+            hydrogenModels = hydroPool.sortedDescending()
 
-            val orderedChat = linkedSetOf<String>()
-            chatPool.filter {
-                it.contains("flash") && !it.contains("lite") && !it.contains("preview") && !it.contains("exp") && !it.contains("latest")
-            }.sortedDescending().forEach { orderedChat.add(it) }
-            if ("gemini-flash-latest" in chatPool) orderedChat.add("gemini-flash-latest")
-            chatPool.filter { it.contains("flash") && it.contains("lite") && !it.contains("preview") }
-                .sortedDescending().forEach { orderedChat.add(it) }
-            chatPool.filter { it.contains("flash") }
-                .sortedDescending().forEach { orderedChat.add(it) }
-            chatPool.sortedDescending().forEach { orderedChat.add(it) }
-            chatModels = orderedChat.toList()
-
-            val ttsPool = genModels.filter { it.contains("tts") }
             val orderedTts = linkedSetOf<String>()
-            ttsPool.filter { it.contains("flash") }.sortedDescending().forEach { orderedTts.add(it) }
+            ttsPool.filter { it.contains("flash", ignoreCase = true) }
+                .sortedDescending()
+                .forEach { orderedTts.add(it) }
             ttsPool.sortedDescending().forEach { orderedTts.add(it) }
             ttsModels = orderedTts.toList()
         }
@@ -119,6 +118,110 @@ Aturan wajib:
         JSONObject(raw).getJSONObject("error").optString("message", raw)
     }.getOrDefault(raw)
 
+    private fun extractReplyText(json: JSONObject): String {
+        val parts = json.optJSONArray("candidates")
+            ?.optJSONObject(0)
+            ?.optJSONObject("content")
+            ?.optJSONArray("parts") ?: return ""
+        val sb = StringBuilder()
+        for (i in 0 until parts.length()) {
+            val part = parts.optJSONObject(i) ?: continue
+            if (part.optBoolean("thought", false)) continue
+            val t = part.optString("text", "")
+            if (t.isNotEmpty()) sb.append(t)
+        }
+        return sb.toString().trim()
+    }
+
+    private fun normalizeHistory(history: List<ChatMessage>): List<ChatMessage> {
+        val cleaned = mutableListOf<ChatMessage>()
+        for (msg in history) {
+            if (msg.text.startsWith("Gagal konek Gemini:")) continue
+            val expectedRole = if (cleaned.size % 2 == 0) "user" else "model"
+            if (msg.role == expectedRole) {
+                cleaned.add(msg)
+            }
+        }
+        if (cleaned.isNotEmpty() && cleaned.last().role == "user") {
+            cleaned.removeAt(cleaned.lastIndex)
+        }
+        return cleaned.takeLast(8)
+    }
+
+    private fun buildChatBody(
+        model: String,
+        history: List<ChatMessage>,
+        userText: String,
+        imageBase64: String?,
+        thinkingMode: String?
+    ): String {
+        val isGemma = model.startsWith("gemma", ignoreCase = true)
+        val contents = JSONArray()
+
+        if (isGemma) {
+            contents.put(
+                JSONObject().apply {
+                    put("role", "user")
+                    put("parts", JSONArray().put(JSONObject().put("text", SYSTEM_PROMPT)))
+                }
+            )
+            contents.put(
+                JSONObject().apply {
+                    put("role", "model")
+                    put("parts", JSONArray().put(JSONObject().put("text", "[MARAH] Hmph, yaudah ngerti!")))
+                }
+            )
+        }
+
+        for (msg in normalizeHistory(history)) {
+            contents.put(
+                JSONObject().apply {
+                    put("role", msg.role)
+                    put("parts", JSONArray().put(JSONObject().put("text", msg.text)))
+                }
+            )
+        }
+
+        val userParts = JSONArray()
+        if (imageBase64 != null) {
+            userParts.put(
+                JSONObject().put(
+                    "inlineData",
+                    JSONObject().apply {
+                        put("mimeType", "image/jpeg")
+                        put("data", imageBase64)
+                    }
+                )
+            )
+        }
+        userParts.put(JSONObject().put("text", userText))
+        contents.put(
+            JSONObject().apply {
+                put("role", "user")
+                put("parts", userParts)
+            }
+        )
+
+        return JSONObject().apply {
+            if (!isGemma) {
+                put(
+                    "systemInstruction",
+                    JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM_PROMPT)))
+                )
+            }
+            if (thinkingMode != null) {
+                val thinkingObj = JSONObject().apply {
+                    when (thinkingMode) {
+                        "LEVEL_LOW" -> put("thinkingLevel", "LOW")
+                        "BUDGET_LOW" -> put("thinkingBudget", 1024)
+                    }
+                }
+                put("generationConfig", JSONObject().put("thinkingConfig", thinkingObj))
+            }
+            put("contents", contents)
+        }.toString()
+    }
+
     suspend fun askJamal(
         apiKey: String,
         history: List<ChatMessage>,
@@ -126,53 +229,22 @@ Aturan wajib:
         imageBase64: String? = null
     ): Result<JamalReply> = withContext(Dispatchers.IO) {
         runCatching {
-            ensureModels(apiKey)
-            val candidates = chatModels.take(4).ifEmpty {
-                listOf("gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite")
-            }
+            ensureModelCatalog(apiKey)
 
-            val contents = JSONArray()
-            history.takeLast(8).forEach { msg ->
-                contents.put(
-                    JSONObject().apply {
-                        put("role", msg.role)
-                        put("parts", JSONArray().put(JSONObject().put("text", msg.text)))
-                    }
-                )
-            }
+            val fullChain = buildList {
+                addAll(hydrogenModels.take(2))
+                addAll(CHAT_FALLBACK_CHAIN)
+            }.distinct()
 
-            val userParts = JSONArray()
-            if (imageBase64 != null) {
-                userParts.put(
-                    JSONObject().put(
-                        "inlineData",
-                        JSONObject().apply {
-                            put("mimeType", "image/jpeg")
-                            put("data", imageBase64)
-                        }
-                    )
-                )
-            }
-            userParts.put(JSONObject().put("text", userText))
-            contents.put(
-                JSONObject().apply {
-                    put("role", "user")
-                    put("parts", userParts)
-                }
-            )
+            val errors = mutableListOf<String>()
 
-            val bodyJson = JSONObject().apply {
-                put(
-                    "systemInstruction",
-                    JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM_PROMPT)))
-                )
-                put("contents", contents)
-            }.toString()
+            for (model in fullChain) {
+                val isHydrogen = model.contains("hydrogen", ignoreCase = true)
+                val thinkingModes = if (isHydrogen) listOf("LEVEL_LOW", "BUDGET_LOW") else listOf(null)
 
-            var lastErr = "Server Gemini lagi sibuk."
-
-            for (model in candidates) {
-                for (attempt in 1..2) {
+                var succeededReply: JamalReply? = null
+                for (tMode in thinkingModes) {
+                    val bodyJson = buildChatBody(model, history, userText, imageBase64, tMode)
                     val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
                     val req = Request.Builder()
                         .url(url)
@@ -185,31 +257,32 @@ Aturan wajib:
 
                     if (isOk) {
                         val json = JSONObject(raw)
-                        val parts = json.optJSONArray("candidates")
-                            ?.optJSONObject(0)
-                            ?.optJSONObject("content")
-                            ?.optJSONArray("parts")
-                        val replyRaw = parts?.optJSONObject(0)?.optString("text")?.trim().orEmpty()
-                        return@runCatching if (replyRaw.isEmpty()) {
+                        val replyRaw = extractReplyText(json)
+                        succeededReply = if (replyRaw.isEmpty()) {
                             JamalReply("MARAH", "Heh! Ngomong yang bener dikit kenapa sih, males banget gue jawab beginian!")
                         } else {
                             parseReply(replyRaw)
                         }
-                    }
-
-                    lastErr = "($model) HTTP $code: ${extractApiErrorMessage(raw)}"
-                    if (code == 404) {
                         break
                     }
-                    if (code == 503 || code == 429 || code >= 500) {
-                        if (attempt == 1) delay(700L)
-                        else break
-                    } else {
-                        throw IllegalStateException(lastErr)
+
+                    val errMsg = "$model (HTTP $code: ${extractApiErrorMessage(raw).take(70)})"
+                    if (code == 401 || code == 403) {
+                        throw IllegalStateException(errMsg)
                     }
+                    if (code == 400 && tMode == "LEVEL_LOW") {
+                        continue
+                    }
+                    errors.add(errMsg)
+                    break
+                }
+
+                if (succeededReply != null) {
+                    return@runCatching succeededReply
                 }
             }
-            throw IllegalStateException(lastErr)
+
+            throw IllegalStateException(errors.joinToString(" -> "))
         }
     }
 
@@ -246,7 +319,7 @@ Aturan wajib:
                 return@runCatching cacheFile.readBytes()
             }
 
-            ensureModels(apiKey)
+            ensureModelCatalog(apiKey)
             val candidates = ttsModels.take(2).ifEmpty {
                 listOf("gemini-2.5-flash-preview-tts")
             }
