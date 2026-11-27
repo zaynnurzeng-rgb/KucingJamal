@@ -23,30 +23,38 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Chat
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.Quiz
 import androidx.compose.material.icons.filled.RecordVoiceOver
+import androidx.compose.material.icons.filled.Restaurant
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -55,7 +63,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -199,6 +206,8 @@ fun KucingJamalScreen() {
     var chatInput by remember { mutableStateOf("") }
     var messages by remember { mutableStateOf(ChatStorage.load(context)) }
     var memories by remember { mutableStateOf(MemoryStorage.load(context)) }
+    var petStatus by remember { mutableStateOf(PetStateStorage.load(context)) }
+
     var isBusy by remember { mutableStateOf(false) }
     var isSpeaking by remember { mutableStateOf(false) }
     var isListening by remember { mutableStateOf(false) }
@@ -213,6 +222,13 @@ fun KucingJamalScreen() {
             "Hmph! Jangan elus-elus, bukan berarti gue suka ya!",
             "Ih apaan sih pegang-pegang... eh bentar, lanjut dikit boleh deh.",
             "Ck, sok akrab banget ngelus-ngelus gue!"
+        )
+    }
+    val eatLines = remember {
+        listOf(
+            "Hmph, lumayan enak... bukan berarti gue berterima kasih ya!",
+            "Akhirnya dikasih makan juga! Tadi perut gue hampir protes.",
+            "Nyam nyam... yaudah deh, kali ini gue maafin lu."
         )
     }
 
@@ -245,7 +261,15 @@ fun KucingJamalScreen() {
     var currentFrame by remember { mutableStateOf(idleBitmap) }
     var currentAnim by remember { mutableStateOf(JamalAnim.IDLE) }
     var triggerCount by remember { mutableIntStateOf(0) }
-    var statusText by remember { mutableStateOf("Heh, mau ngapain lu?!") }
+    var statusText by remember {
+        mutableStateOf(
+            when {
+                petStatus.hunger <= 30 -> "Woi! Gue laper nih, kasih makan dulu kek!"
+                petStatus.mood <= 30 -> "Ck, mood gue lagi jelek. Jangan macem-macem!"
+                else -> "Heh, mau ngapain lu?!"
+            }
+        )
+    }
 
     // Simpan riwayat obrolan secara permanen tiap ada perubahan
     LaunchedEffect(messages) {
@@ -254,10 +278,22 @@ fun KucingJamalScreen() {
         }
     }
 
+    // Perbarui decay Kenyang & Mood secara berkala saat aplikasi terbuka
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(180_000L)
+            petStatus = PetStateStorage.load(context)
+        }
+    }
+
     fun hasValidKeys(): Boolean = GeminiClient.parseApiKeys(apiKeysRaw).isNotEmpty()
 
     fun markActive() {
         lastInteractionAt = System.currentTimeMillis()
+    }
+
+    fun updateStats(deltaHunger: Int = 0, deltaMood: Int = 0) {
+        petStatus = PetStateStorage.adjust(context, petStatus, deltaHunger, deltaMood)
     }
 
     fun stopCurrentSpeech() {
@@ -310,8 +346,17 @@ fun KucingJamalScreen() {
         }
     }
 
-    fun playAnim(anim: JamalAnim, caption: String? = null, speak: Boolean = true) {
+    fun playAnim(
+        anim: JamalAnim,
+        caption: String? = null,
+        speak: Boolean = true,
+        deltaHunger: Int = 0,
+        deltaMood: Int = 0
+    ) {
         markActive()
+        if (deltaHunger != 0 || deltaMood != 0) {
+            updateStats(deltaHunger, deltaMood)
+        }
         currentAnim = anim
         triggerCount++
         if (caption != null) statusText = caption
@@ -337,7 +382,7 @@ fun KucingJamalScreen() {
     fun sendToJamal(prompt: String, imageBase64: String? = null, displayPrompt: String = prompt) {
         markActive()
         if (!hasValidKeys()) {
-            statusText = "Isi Gemini API Key dulu di ikon gerigi kanan atas!"
+            statusText = "Isi Gemini API Key dulu di tombol Option kanan atas!"
             showSettings = true
             return
         }
@@ -354,14 +399,16 @@ fun KucingJamalScreen() {
                 history = messages.dropLast(1),
                 userText = prompt,
                 imageBase64 = imageBase64,
-                memories = memories
+                memories = memories,
+                petStatus = petStatus
             )
             res.onSuccess { reply ->
                 if (reply.newMemories.isNotEmpty()) {
                     memories = MemoryStorage.merge(context, memories, reply.newMemories)
                 }
+                updateStats(deltaHunger = -3, deltaMood = 3)
                 messages = messages + ChatMessage("model", reply.text)
-                statusText = reply.text
+                statusText = reply.text.replace("**", "")
                 isBusy = false
                 markActive()
 
@@ -407,6 +454,7 @@ fun KucingJamalScreen() {
             isMimicRecording = false
 
             res.onSuccess { pitchedPcm ->
+                updateStats(deltaMood = 4)
                 statusText = "Hehe, dengerin suara lu sendiri nih!"
                 isSpeaking = true
                 currentAnim = JamalAnim.TALK
@@ -554,7 +602,7 @@ fun KucingJamalScreen() {
         }
     }
 
-    // Engine Animasi ~16 FPS + Perilaku Idle Otomatis (Menguap / Bersin > 20 detik)
+    // Engine Animasi ~16 FPS + Perilaku Idle Otomatis
     LaunchedEffect(currentAnim, triggerCount) {
         when (currentAnim) {
             JamalAnim.IDLE -> {
@@ -623,6 +671,16 @@ fun KucingJamalScreen() {
         }
     }
 
+    val fieldColors = OutlinedTextFieldDefaults.colors(
+        focusedTextColor = GamePalette.TextBrown,
+        unfocusedTextColor = GamePalette.TextBrown,
+        focusedBorderColor = GamePalette.Teal,
+        unfocusedBorderColor = GamePalette.CreamDark,
+        focusedContainerColor = Color.White,
+        unfocusedContainerColor = Color.White,
+        cursorColor = GamePalette.Teal
+    )
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -653,21 +711,25 @@ fun KucingJamalScreen() {
                                         val nx = startPos.x / size.width.toFloat()
                                         val ny = startPos.y / size.height.toFloat()
                                         when {
-                                            ny in 0.14f..0.46f -> playAnim(
+                                            ny in 0.16f..0.46f -> playAnim(
                                                 JamalAnim.KNOCKOUT,
-                                                "Woi! Jangan pukul kepala gue!"
+                                                "Woi! Jangan pukul kepala gue!",
+                                                deltaMood = -18
                                             )
                                             ny in 0.46f..0.72f -> playAnim(
                                                 JamalAnim.STOMACH,
-                                                "Ih apaan sih colek-colek perut!"
+                                                "Ih apaan sih colek-colek perut!",
+                                                deltaMood = -6
                                             )
                                             ny > 0.72f && nx < 0.5f -> playAnim(
                                                 JamalAnim.FOOT_RIGHT,
-                                                "Aw! Kaki kanan gue sakit tau!"
+                                                "Aw! Kaki kanan gue sakit tau!",
+                                                deltaMood = -8
                                             )
                                             ny > 0.72f && nx >= 0.5f -> playAnim(
                                                 JamalAnim.FOOT_LEFT,
-                                                "Heh! Jangan injek kaki kiri!"
+                                                "Heh! Jangan injek kaki kiri!",
+                                                deltaMood = -8
                                             )
                                         }
                                     }
@@ -681,9 +743,13 @@ fun KucingJamalScreen() {
 
                                 if (!petTriggered && totalDrag > maxOf(touchSlop * 2.5f, 55f)) {
                                     val ny = startPos.y / size.height.toFloat()
-                                    if (ny in 0.14f..0.72f) {
+                                    if (ny in 0.16f..0.72f) {
                                         petTriggered = true
-                                        playAnim(JamalAnim.HAPPY_SHORT, petLines.random())
+                                        playAnim(
+                                            JamalAnim.HAPPY_SHORT,
+                                            petLines.random(),
+                                            deltaMood = 15
+                                        )
                                     }
                                 }
                             }
@@ -692,170 +758,233 @@ fun KucingJamalScreen() {
             )
         }
 
-        // Layer 2: Status Bubble + Tombol Stop Bicara + Tombol Memori + Tombol Pengaturan
+        // Layer 2: Top Game HUD Hijau Limau (Mood + Kenyang + Memori + Option) + Bubble Dialog Krem
         Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
-                .statusBarsPadding()
-                .padding(top = 10.dp, start = 14.dp, end = 14.dp)
         ) {
+            // Top HUD Bar Hijau Limau dengan Bevel 3D
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(GamePalette.LimeShadow)
+                    .padding(bottom = 4.dp)
+                    .clip(RoundedCornerShape(bottomStart = 20.dp, bottomEnd = 20.dp))
+                    .background(GamePalette.LimeTop)
+                    .statusBarsPadding()
+                    .padding(horizontal = 10.dp, vertical = 8.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    StripedStatusPill(
+                        value = petStatus.mood,
+                        icon = Icons.Filled.Favorite,
+                        iconTint = GamePalette.Red,
+                        fillColor = GamePalette.Red,
+                        stripeColor = GamePalette.RedStripe,
+                        modifier = Modifier.weight(1f)
+                    )
+                    StripedStatusPill(
+                        value = petStatus.hunger,
+                        icon = Icons.Filled.Restaurant,
+                        iconTint = GamePalette.Orange,
+                        fillColor = GamePalette.Orange,
+                        stripeColor = GamePalette.OrangeStripe,
+                        modifier = Modifier.weight(1f)
+                    )
+                    GameVectorCircleButton(
+                        icon = Icons.Filled.Psychology,
+                        bgColor = if (memories.isNotEmpty()) GamePalette.Purple else GamePalette.Teal,
+                        shadowColor = if (memories.isNotEmpty()) GamePalette.PurpleShadow else GamePalette.TealShadow,
+                        contentDescription = "Memori Jamal",
+                        size = 40.dp,
+                        iconSize = 19.dp
+                    ) {
+                        markActive()
+                        showMemoryDialog = true
+                    }
+                    GameVectorCircleButton(
+                        icon = Icons.Filled.Settings,
+                        bgColor = GamePalette.Teal,
+                        shadowColor = GamePalette.TealShadow,
+                        contentDescription = "Option",
+                        size = 40.dp,
+                        iconSize = 19.dp
+                    ) {
+                        markActive()
+                        showSettings = true
+                    }
+                }
+            }
+
+            // Bubble Ucapan Krem + Tombol Stop Bicara
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp, start = 12.dp, end = 12.dp)
             ) {
-                Surface(
-                    color = Color.Black.copy(alpha = 0.62f),
-                    shape = RoundedCornerShape(20.dp),
+                Box(
                     modifier = Modifier
                         .weight(1f)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(GamePalette.CreamDark)
+                        .padding(bottom = 3.dp)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(GamePalette.Cream.copy(alpha = 0.95f))
                         .clickable {
                             markActive()
                             showChat = true
                         }
+                        .padding(horizontal = 14.dp, vertical = 9.dp)
                 ) {
                     Text(
                         text = statusText,
-                        color = Color.White,
+                        color = GamePalette.TextBrown,
                         fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
                         maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
 
                 if (isSpeaking) {
-                    Spacer(Modifier.width(6.dp))
-                    IconButton(
-                        onClick = {
-                            markActive()
-                            stopCurrentSpeech()
-                            currentAnim = JamalAnim.IDLE
-                            statusText = "Iya iya, gue diem deh!"
-                        },
-                        modifier = Modifier
-                            .size(40.dp)
-                            .clip(CircleShape)
-                            .background(Color(0xD9D32F2F))
+                    Spacer(Modifier.width(8.dp))
+                    GameVectorCircleButton(
+                        icon = Icons.Filled.VolumeOff,
+                        bgColor = GamePalette.Red,
+                        shadowColor = GamePalette.RedShadow,
+                        contentDescription = "Stop Bicara",
+                        size = 44.dp,
+                        iconSize = 20.dp
                     ) {
-                        Icon(
-                            Icons.Filled.VolumeOff,
-                            contentDescription = "Stop Bicara",
-                            tint = Color.White,
-                            modifier = Modifier.size(20.dp)
-                        )
+                        markActive()
+                        stopCurrentSpeech()
+                        currentAnim = JamalAnim.IDLE
+                        statusText = "Iya iya, gue diem deh!"
                     }
-                }
-
-                Spacer(Modifier.width(6.dp))
-                IconButton(
-                    onClick = {
-                        markActive()
-                        showMemoryDialog = true
-                    },
-                    modifier = Modifier
-                        .size(40.dp)
-                        .clip(CircleShape)
-                        .background(
-                            if (memories.isNotEmpty()) Color(0xCC5E35B1)
-                            else Color.Black.copy(alpha = 0.62f)
-                        )
-                ) {
-                    Icon(
-                        Icons.Filled.Psychology,
-                        contentDescription = "Memori Jamal",
-                        tint = Color.White,
-                        modifier = Modifier.size(21.dp)
-                    )
-                }
-
-                Spacer(Modifier.width(6.dp))
-                IconButton(
-                    onClick = {
-                        markActive()
-                        showSettings = true
-                    },
-                    modifier = Modifier
-                        .size(40.dp)
-                        .clip(CircleShape)
-                        .background(Color.Black.copy(alpha = 0.62f))
-                ) {
-                    Icon(
-                        Icons.Filled.Settings,
-                        contentDescription = "API Key",
-                        tint = Color.White,
-                        modifier = Modifier.size(20.dp)
-                    )
                 }
             }
 
             ttsErrorBanner?.let { errText ->
                 Spacer(Modifier.height(6.dp))
-                Surface(
-                    color = Color(0xCCB71C1C),
-                    shape = RoundedCornerShape(14.dp),
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .padding(horizontal = 12.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(GamePalette.RedShadow)
+                        .padding(bottom = 2.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(GamePalette.Red)
                         .clickable { ttsErrorBanner = null }
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
                 ) {
                     Text(
                         text = errText,
                         color = Color.White,
                         fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
                         maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
         }
 
-        // Layer 3: Tombol Aksi Klasik (Sisi Kiri)
+        // Layer 3: Tombol Aksi Klasik + Tombol Makan Baru (Sisi Kiri bergaya Game Circle)
         Column(
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier
                 .align(Alignment.CenterStart)
-                .padding(start = 12.dp)
+                .padding(start = 10.dp, top = 46.dp)
         ) {
-            ClassicIconButton(context, "button_milk.png", "Susu") {
-                playAnim(JamalAnim.DRINK, "Hmph, yaudah deh gue minum susunya...")
+            GameVectorCircleButton(
+                icon = Icons.Filled.Restaurant,
+                bgColor = GamePalette.Orange,
+                shadowColor = GamePalette.OrangeShadow,
+                contentDescription = "Makan",
+                size = 50.dp,
+                iconSize = 23.dp
+            ) {
+                playAnim(
+                    JamalAnim.EAT,
+                    eatLines.random(),
+                    deltaHunger = 30,
+                    deltaMood = 10
+                )
             }
-            ClassicIconButton(context, "cake.png", "Pai") {
-                playAnim(JamalAnim.PIE, "Woi kurang ajar lempar-lempar pai!")
+            ClassicGameIconButton(context, "button_milk.png", "Susu", GamePalette.Teal, GamePalette.TealShadow) {
+                playAnim(
+                    JamalAnim.DRINK,
+                    "Hmph, yaudah deh gue minum susunya...",
+                    deltaHunger = 18,
+                    deltaMood = 8
+                )
             }
-            ClassicIconButton(context, "cinele.png", "Simbal") {
-                playAnim(JamalAnim.CYMBAL, "BERISIK TAU GAK!!")
+            ClassicGameIconButton(context, "cake.png", "Pai", GamePalette.Orange, GamePalette.OrangeShadow) {
+                playAnim(
+                    JamalAnim.PIE,
+                    "Woi kurang ajar lempar-lempar pai!",
+                    deltaMood = -10
+                )
             }
-            ClassicIconButton(context, "btngasmask.png", "Kentut") {
-                playAnim(JamalAnim.FART, "Bukan gue! Salahin temboknya!")
+            ClassicGameIconButton(context, "cinele.png", "Simbal", GamePalette.GreenBtn, GamePalette.GreenBtnShadow) {
+                playAnim(
+                    JamalAnim.CYMBAL,
+                    "BERISIK TAU GAK!!",
+                    deltaMood = -10
+                )
             }
-            ClassicIconButton(context, "btnprint.png", "Cakar") {
-                playAnim(JamalAnim.SCRATCH, "Rasain nih cakaran gue!")
+            ClassicGameIconButton(context, "btngasmask.png", "Kentut", GamePalette.Purple, GamePalette.PurpleShadow) {
+                playAnim(
+                    JamalAnim.FART,
+                    "Bukan gue! Salahin temboknya!",
+                    deltaMood = -4
+                )
+            }
+            ClassicGameIconButton(context, "btnprint.png", "Cakar", GamePalette.Red, GamePalette.RedShadow) {
+                playAnim(
+                    JamalAnim.SCRATCH,
+                    "Rasain nih cakaran gue!",
+                    deltaMood = -8
+                )
             }
         }
 
-        // Layer 4: Bar Asisten AI + Mode Tirukan Offline (Bawah)
+        // Layer 4: Bar Asisten AI + Mode Tirukan Offline (Bawah bergaya Game Circle 3D)
         Row(
             horizontalArrangement = Arrangement.spacedBy(14.dp),
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .navigationBarsPadding()
-                .padding(bottom = 22.dp)
+                .padding(bottom = 20.dp)
         ) {
-            AiActionButton(
+            GameVectorCircleButton(
                 icon = Icons.Filled.CameraAlt,
-                label = "Foto PR",
-                bg = Color(0xFF1E88E5)
+                bgColor = GamePalette.Blue,
+                shadowColor = GamePalette.BlueShadow,
+                contentDescription = "Foto PR",
+                size = 54.dp,
+                iconSize = 24.dp,
+                label = "Foto PR"
             ) {
                 markActive()
                 showPhotoSourceDialog = true
             }
-            AiActionButton(
+            GameVectorCircleButton(
                 icon = Icons.Filled.Mic,
-                label = if (isListening) "Dengerin..." else "Ngobrol",
-                bg = if (isListening) Color(0xFFE53935) else Color(0xFF43A047),
-                big = true
+                bgColor = if (isListening) GamePalette.Red else GamePalette.GreenBtn,
+                shadowColor = if (isListening) GamePalette.RedShadow else GamePalette.GreenBtnShadow,
+                contentDescription = "Ngobrol",
+                size = 66.dp,
+                iconSize = 30.dp,
+                label = if (isListening) "Dengerin" else "Ngobrol"
             ) {
                 markActive()
                 pendingMicAction = "ai"
@@ -865,10 +994,14 @@ fun KucingJamalScreen() {
                 if (hasPerm) startVoiceInput()
                 else micPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
             }
-            AiActionButton(
+            GameVectorCircleButton(
                 icon = Icons.Filled.RecordVoiceOver,
-                label = if (isMimicRecording) "Stop" else "Tirukan",
-                bg = if (isMimicRecording) Color(0xFFE53935) else Color(0xFF8E24AA)
+                bgColor = if (isMimicRecording) GamePalette.Red else GamePalette.Purple,
+                shadowColor = if (isMimicRecording) GamePalette.RedShadow else GamePalette.PurpleShadow,
+                contentDescription = "Tirukan",
+                size = 54.dp,
+                iconSize = 24.dp,
+                label = if (isMimicRecording) "Stop" else "Tirukan"
             ) {
                 markActive()
                 pendingMicAction = "mimic"
@@ -878,10 +1011,14 @@ fun KucingJamalScreen() {
                 if (hasPerm) startOfflineMimic()
                 else micPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
             }
-            AiActionButton(
+            GameVectorCircleButton(
                 icon = Icons.Filled.Chat,
-                label = "Chat",
-                bg = Color(0xFFFB8C00)
+                bgColor = GamePalette.Orange,
+                shadowColor = GamePalette.OrangeShadow,
+                contentDescription = "Chat",
+                size = 54.dp,
+                iconSize = 24.dp,
+                label = "Chat"
             ) {
                 markActive()
                 showChat = true
@@ -889,182 +1026,217 @@ fun KucingJamalScreen() {
         }
     }
 
-    // Dialog Memori Jangka Panjang Kucing Jamal
+    // Dialog Memori Jangka Panjang Kucing Jamal (Gaya Game Card)
     if (showMemoryDialog) {
         var newFactInput by remember { mutableStateOf("") }
-        AlertDialog(
-            onDismissRequest = { showMemoryDialog = false },
-            title = { Text("Ingatan Jamal (${memories.size})") },
-            text = {
-                Column(modifier = Modifier.fillMaxWidth()) {
-                    Text(
-                        "Jamal otomatis mengingat fakta tentang kamu saat ngobrol, dan tetap ingat meski riwayat chat dihapus.",
-                        fontSize = 12.sp
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        OutlinedTextField(
-                            value = newFactInput,
-                            onValueChange = { newFactInput = it },
-                            placeholder = { Text("Tambah manual (misal: Nama gue Zayn)") },
-                            singleLine = true,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Spacer(Modifier.width(6.dp))
-                        IconButton(
-                            enabled = newFactInput.isNotBlank(),
-                            onClick = {
-                                memories = MemoryStorage.merge(context, memories, listOf(newFactInput))
-                                newFactInput = ""
-                            }
-                        ) {
-                            Icon(Icons.Filled.Add, contentDescription = "Tambah Ingatan")
-                        }
+        GameDialogCard(
+            title = "Ingatan Jamal (${memories.size})",
+            headerColor = GamePalette.Purple,
+            headerShadow = GamePalette.PurpleShadow,
+            onDismiss = { showMemoryDialog = false }
+        ) {
+            Text(
+                "Jamal otomatis mencatat fakta tentang kamu saat ngobrol dan tetap ingat walau chat dihapus.",
+                color = GamePalette.TextBrownSoft,
+                fontSize = 12.sp
+            )
+            Spacer(Modifier.height(10.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                OutlinedTextField(
+                    value = newFactInput,
+                    onValueChange = { newFactInput = it },
+                    placeholder = { Text("Misal: Nama gue Zayn", fontSize = 13.sp) },
+                    singleLine = true,
+                    colors = fieldColors,
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(Modifier.width(8.dp))
+                GameVectorCircleButton(
+                    icon = Icons.Filled.Add,
+                    bgColor = GamePalette.GreenBtn,
+                    shadowColor = GamePalette.GreenBtnShadow,
+                    contentDescription = "Tambah",
+                    size = 46.dp,
+                    iconSize = 22.dp
+                ) {
+                    if (newFactInput.isNotBlank()) {
+                        memories = MemoryStorage.merge(context, memories, listOf(newFactInput))
+                        newFactInput = ""
                     }
-                    Spacer(Modifier.height(8.dp))
-                    if (memories.isEmpty()) {
-                        Text(
-                            "Belum ada ingatan. Coba kenalkan namamu atau hobimu ke Jamal!",
-                            fontSize = 12.sp,
-                            color = Color.Gray
-                        )
-                    } else {
-                        LazyColumn(
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            if (memories.isEmpty()) {
+                Text(
+                    "Belum ada ingatan. Coba kenalkan namamu atau hobimu ke Jamal!",
+                    fontSize = 12.sp,
+                    color = GamePalette.TextBrownSoft
+                )
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 210.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    itemsIndexed(memories) { idx, item ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .heightIn(max = 220.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color.White)
+                                .border(1.5.dp, GamePalette.CreamDark, RoundedCornerShape(12.dp))
+                                .padding(start = 10.dp, end = 6.dp, top = 6.dp, bottom = 6.dp)
                         ) {
-                            itemsIndexed(memories) { idx, item ->
-                                Surface(
-                                    color = Color(0xFFF3E5F5),
-                                    shape = RoundedCornerShape(10.dp),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        modifier = Modifier.padding(start = 10.dp, end = 4.dp, top = 4.dp, bottom = 4.dp)
-                                    ) {
-                                        Text(
-                                            text = "• $item",
-                                            color = Color.Black,
-                                            fontSize = 13.sp,
-                                            modifier = Modifier.weight(1f)
-                                        )
-                                        IconButton(
-                                            onClick = {
-                                                memories = MemoryStorage.removeAt(context, memories, idx)
-                                            },
-                                            modifier = Modifier.size(32.dp)
-                                        ) {
-                                            Icon(
-                                                Icons.Filled.Close,
-                                                contentDescription = "Hapus",
-                                                tint = Color(0xFF6A1B9A),
-                                                modifier = Modifier.size(16.dp)
-                                            )
-                                        }
-                                    }
-                                }
+                            Text(
+                                text = "• $item",
+                                color = GamePalette.TextBrown,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.weight(1f)
+                            )
+                            IconButton(
+                                onClick = {
+                                    memories = MemoryStorage.removeAt(context, memories, idx)
+                                },
+                                modifier = Modifier.size(28.dp)
+                            ) {
+                                Icon(
+                                    Icons.Filled.Close,
+                                    contentDescription = "Hapus",
+                                    tint = GamePalette.Red,
+                                    modifier = Modifier.size(16.dp)
+                                )
                             }
                         }
                     }
                 }
-            },
-            confirmButton = {
-                TextButton(onClick = { showMemoryDialog = false }) { Text("Tutup") }
-            },
-            dismissButton = {
+            }
+            Spacer(Modifier.height(14.dp))
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
                 if (memories.isNotEmpty()) {
-                    TextButton(onClick = {
+                    GamePillButton(
+                        text = "HAPUS SEMUA",
+                        bgColor = GamePalette.Red,
+                        shadowColor = GamePalette.RedShadow,
+                        modifier = Modifier.weight(1f)
+                    ) {
                         memories = MemoryStorage.clear(context)
                         statusText = "Semua ingatan tentang lu udah gue lupain!"
-                    }) {
-                        Text("Hapus Semua", color = Color(0xFFD32F2F))
                     }
                 }
+                GamePillButton(
+                    text = "OK",
+                    bgColor = GamePalette.Teal,
+                    shadowColor = GamePalette.TealShadow,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    showMemoryDialog = false
+                }
             }
-        )
+        }
     }
 
-    // Dialog Pilih Sumber Foto PR (Kamera Langsung vs Galeri)
+    // Dialog Pilih Sumber Foto PR (Gaya Game Card)
     if (showPhotoSourceDialog) {
-        AlertDialog(
-            onDismissRequest = { showPhotoSourceDialog = false },
-            title = { Text("Kirim Soal PR") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text(
-                        "Pilih mau foto langsung soalnya atau ambil dari galeri:",
-                        fontSize = 13.sp
-                    )
-                    Button(
-                        onClick = {
-                            showPhotoSourceDialog = false
-                            val hasCam = ContextCompat.checkSelfPermission(
-                                context, Manifest.permission.CAMERA
-                            ) == PackageManager.PERMISSION_GRANTED
-                            if (hasCam) launchCameraForPr()
-                            else cameraPermLauncher.launch(Manifest.permission.CAMERA)
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(Icons.Filled.CameraAlt, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Foto Langsung (Kamera)")
-                    }
-                    OutlinedButton(
-                        onClick = {
-                            showPhotoSourceDialog = false
-                            photoPicker.launch("image/*")
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(Icons.Filled.PhotoLibrary, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Pilih dari Galeri")
-                    }
-                }
-            },
-            confirmButton = {},
-            dismissButton = {
-                TextButton(onClick = { showPhotoSourceDialog = false }) { Text("Batal") }
+        GameDialogCard(
+            title = "Kirim Soal PR",
+            headerColor = GamePalette.Blue,
+            headerShadow = GamePalette.BlueShadow,
+            onDismiss = { showPhotoSourceDialog = false }
+        ) {
+            Text(
+                "Pilih mau foto langsung pakai kamera atau ambil gambar soal dari galeri:",
+                color = GamePalette.TextBrown,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium
+            )
+            Spacer(Modifier.height(14.dp))
+            GamePillButton(
+                text = "FOTO LANGSUNG (KAMERA)",
+                icon = Icons.Filled.CameraAlt,
+                bgColor = GamePalette.GreenBtn,
+                shadowColor = GamePalette.GreenBtnShadow,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                showPhotoSourceDialog = false
+                val hasCam = ContextCompat.checkSelfPermission(
+                    context, Manifest.permission.CAMERA
+                ) == PackageManager.PERMISSION_GRANTED
+                if (hasCam) launchCameraForPr()
+                else cameraPermLauncher.launch(Manifest.permission.CAMERA)
             }
-        )
+            Spacer(Modifier.height(10.dp))
+            GamePillButton(
+                text = "PILIH DARI GALERI",
+                icon = Icons.Filled.PhotoLibrary,
+                bgColor = GamePalette.Orange,
+                shadowColor = GamePalette.OrangeShadow,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                showPhotoSourceDialog = false
+                photoPicker.launch("image/*")
+            }
+        }
     }
 
-    // Dialog Pratinjau Foto PR + Catatan Tambahan Sebelum Dikirim
+    // Dialog Pratinjau Foto PR + Catatan Tambahan (Gaya Game Card)
     pendingPrPhoto?.let { photo ->
-        AlertDialog(
-            onDismissRequest = { pendingPrPhoto = null },
-            title = { Text("Pratinjau Soal PR") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Image(
-                        bitmap = photo.preview,
-                        contentDescription = "Pratinjau Foto PR",
-                        contentScale = ContentScale.Fit,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 220.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(Color(0xFF1E1E1E))
-                    )
-                    OutlinedTextField(
-                        value = prNoteInput,
-                        onValueChange = { prNoteInput = it },
-                        label = { Text("Catatan tambahan (opsional)") },
-                        placeholder = { Text("Misal: kerjakan nomor 3 aja") },
-                        maxLines = 3,
-                        modifier = Modifier.fillMaxWidth()
-                    )
+        GameDialogCard(
+            title = "Pratinjau Soal PR",
+            headerColor = GamePalette.Teal,
+            headerShadow = GamePalette.TealShadow,
+            onDismiss = { pendingPrPhoto = null }
+        ) {
+            Image(
+                bitmap = photo.preview,
+                contentDescription = "Pratinjau Foto PR",
+                contentScale = ContentScale.Fit,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 210.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Color(0xFF231F1D))
+                    .border(2.dp, GamePalette.CreamDark, RoundedCornerShape(14.dp))
+            )
+            Spacer(Modifier.height(10.dp))
+            OutlinedTextField(
+                value = prNoteInput,
+                onValueChange = { prNoteInput = it },
+                label = { Text("Catatan tambahan (opsional)") },
+                placeholder = { Text("Misal: kerjakan nomor 3 aja") },
+                maxLines = 3,
+                colors = fieldColors,
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(14.dp))
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                GamePillButton(
+                    text = "BATAL",
+                    bgColor = GamePalette.Red,
+                    shadowColor = GamePalette.RedShadow,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    pendingPrPhoto = null
                 }
-            },
-            confirmButton = {
-                Button(onClick = {
+                GamePillButton(
+                    text = "KIRIM KE JAMAL",
+                    bgColor = GamePalette.GreenBtn,
+                    shadowColor = GamePalette.GreenBtnShadow,
+                    modifier = Modifier.weight(1.4f)
+                ) {
                     val note = prNoteInput.trim()
                     val promptText = if (note.isEmpty()) {
                         "Tolong kerjakan dan jelaskan soal PR yang ada di gambar ini dengan jelas."
@@ -1080,17 +1252,12 @@ fun KucingJamalScreen() {
                     pendingPrPhoto = null
                     prNoteInput = ""
                     sendToJamal(prompt = promptText, imageBase64 = b64, displayPrompt = displayText)
-                }) {
-                    Text("Kirim ke Jamal")
                 }
-            },
-            dismissButton = {
-                TextButton(onClick = { pendingPrPhoto = null }) { Text("Batal") }
             }
-        )
+        }
     }
 
-    // Panel Chat & Jawaban PR (Bottom Sheet + Riwayat Permanen + Hapus Riwayat)
+    // Panel Chat & Tutor PR (Gaya Game UI + Rich Text + Replay Suara + Tombol Cepat Tutor PR)
     if (showChat) {
         val listState = rememberLazyListState()
         LaunchedEffect(messages.size, showChat) {
@@ -1099,176 +1266,386 @@ fun KucingJamalScreen() {
             }
         }
 
-        ModalBottomSheet(onDismissRequest = { showChat = false }) {
+        ModalBottomSheet(
+            onDismissRequest = { showChat = false },
+            containerColor = GamePalette.Cream,
+            dragHandle = null
+        ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .fillMaxHeight(0.78f)
-                    .padding(horizontal = 16.dp)
+                    .fillMaxHeight(0.82f)
             ) {
+                // Header Teal Panel Chat
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(bottom = 8.dp)
+                        .background(GamePalette.TealShadow)
+                        .padding(bottom = 4.dp)
+                        .background(GamePalette.Teal)
+                        .padding(horizontal = 16.dp, vertical = 12.dp)
                 ) {
                     Text(
-                        "Obrolan & PR bareng Kucing Jamal",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 16.sp
+                        "OBROLAN & TUTOR PR JAMAL",
+                        color = Color.White,
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize = 15.sp
                     )
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
                         if (isSpeaking) {
-                            IconButton(onClick = {
-                                stopCurrentSpeech()
-                                currentAnim = JamalAnim.IDLE
-                                statusText = "Iya iya, gue diem deh!"
-                            }) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .size(32.dp)
+                                    .clip(CircleShape)
+                                    .background(GamePalette.RedShadow)
+                                    .padding(bottom = 2.dp)
+                                    .clip(CircleShape)
+                                    .background(GamePalette.Red)
+                                    .clickable {
+                                        stopCurrentSpeech()
+                                        currentAnim = JamalAnim.IDLE
+                                        statusText = "Iya iya, gue diem deh!"
+                                    }
+                            ) {
                                 Icon(
                                     Icons.Filled.VolumeOff,
                                     contentDescription = "Stop Bicara",
-                                    tint = Color(0xFFD32F2F)
+                                    tint = Color.White,
+                                    modifier = Modifier.size(17.dp)
                                 )
                             }
                         }
-                        IconButton(onClick = { showClearConfirm = true }) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .size(32.dp)
+                                .clip(CircleShape)
+                                .background(GamePalette.OrangeShadow)
+                                .padding(bottom = 2.dp)
+                                .clip(CircleShape)
+                                .background(GamePalette.Orange)
+                                .clickable { showClearConfirm = true }
+                        ) {
                             Icon(
                                 Icons.Filled.Delete,
                                 contentDescription = "Hapus Riwayat",
-                                tint = Color(0xFF757575)
+                                tint = Color.White,
+                                modifier = Modifier.size(17.dp)
+                            )
+                        }
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .size(32.dp)
+                                .clip(CircleShape)
+                                .background(GamePalette.RedShadow)
+                                .padding(bottom = 2.dp)
+                                .clip(CircleShape)
+                                .background(GamePalette.Red)
+                                .clickable { showChat = false }
+                        ) {
+                            Icon(
+                                Icons.Filled.Close,
+                                contentDescription = "Tutup",
+                                tint = Color.White,
+                                modifier = Modifier.size(18.dp)
                             )
                         }
                     }
                 }
 
+                // Daftar Pesan (Rich Text + Tombol Putar Ulang Suara di tiap balasan Jamal)
                 LazyColumn(
                     state = listState,
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                    contentPadding = PaddingValues(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.weight(1f)
                 ) {
                     items(messages) { msg ->
                         val isUser = msg.role == "user"
+                        val isErrorBubble = msg.text.startsWith("Gagal konek Gemini:")
+
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
                         ) {
-                            Surface(
-                                color = if (isUser) Color(0xFF1E88E5) else Color(0xFFEEEEEE),
-                                shape = RoundedCornerShape(14.dp),
-                                modifier = Modifier.widthIn(max = 300.dp)
+                            Column(
+                                horizontalAlignment = if (isUser) Alignment.End else Alignment.Start,
+                                modifier = Modifier.widthIn(max = 315.dp)
                             ) {
-                                SelectionContainer {
-                                    Text(
-                                        text = msg.text,
-                                        color = if (isUser) Color.White else Color.Black,
-                                        fontSize = 14.sp,
-                                        modifier = Modifier.padding(10.dp)
-                                    )
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(16.dp))
+                                        .background(
+                                            when {
+                                                isUser -> GamePalette.TealShadow
+                                                isErrorBubble -> GamePalette.RedShadow
+                                                else -> GamePalette.CreamDark
+                                            }
+                                        )
+                                        .padding(bottom = 3.dp)
+                                        .clip(RoundedCornerShape(16.dp))
+                                        .background(
+                                            when {
+                                                isUser -> GamePalette.Teal
+                                                isErrorBubble -> GamePalette.Red
+                                                else -> Color.White
+                                            }
+                                        )
+                                        .padding(horizontal = 12.dp, vertical = 10.dp)
+                                ) {
+                                    SelectionContainer {
+                                        if (isUser || isErrorBubble) {
+                                            Text(
+                                                text = msg.text,
+                                                color = Color.White,
+                                                fontSize = 14.sp,
+                                                fontWeight = FontWeight.Medium
+                                            )
+                                        } else {
+                                            Text(
+                                                text = parseGameRichText(msg.text),
+                                                color = GamePalette.TextBrown,
+                                                fontSize = 14.sp,
+                                                lineHeight = 20.sp
+                                            )
+                                        }
+                                    }
+                                }
+
+                                // Tombol Putar Ulang Suara pada tiap jawaban Jamal (pakai cache permanen)
+                                if (!isUser && !isErrorBubble) {
+                                    Spacer(Modifier.height(4.dp))
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(50))
+                                            .background(GamePalette.CreamDark.copy(alpha = 0.65f))
+                                            .clickable {
+                                                markActive()
+                                                statusText = msg.text.replace("**", "")
+                                                speakBubble(msg.text, forceTalkAnim = true)
+                                            }
+                                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.VolumeUp,
+                                            contentDescription = "Putar Ulang Suara",
+                                            tint = GamePalette.TealShadow,
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                        Spacer(Modifier.width(4.dp))
+                                        Text(
+                                            text = "Putar Suara",
+                                            color = GamePalette.TealShadow,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
+                // Tombol Cepat Tutor PR (Jelaskan Lebih Simpel & Bikin 1 Soal Latihan)
+                if (messages.size > 1 && !isBusy) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 14.dp, vertical = 4.dp)
+                    ) {
+                        GamePillButton(
+                            text = "Jelaskan Lebih Simpel",
+                            icon = Icons.Filled.AutoAwesome,
+                            bgColor = GamePalette.Orange,
+                            shadowColor = GamePalette.OrangeShadow,
+                            fontSize = 11.sp
+                        ) {
+                            sendToJamal(
+                                prompt = "Jelaskan jawaban terakhirmu tadi dengan bahasa yang jauh lebih simpel, singkat, dan langkah mudah dipahami.",
+                                displayPrompt = "Jelaskan lebih simpel dong!"
+                            )
+                        }
+                        GamePillButton(
+                            text = "Bikin 1 Soal Latihan",
+                            icon = Icons.Filled.Quiz,
+                            bgColor = GamePalette.Purple,
+                            shadowColor = GamePalette.PurpleShadow,
+                            fontSize = 11.sp
+                        ) {
+                            sendToJamal(
+                                prompt = "Buatkan 1 soal latihan baru yang mirip dengan topik terakhir tadi untuk aku kerjakan. Jangan langsung kasih jawabannya dulu, tunggu aku jawab.",
+                                displayPrompt = "Bikinin 1 soal latihan mirip tadi!"
+                            )
+                        }
+                    }
+                }
+
+                // Input Chat
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(vertical = 10.dp)
+                        .navigationBarsPadding()
+                        .padding(horizontal = 14.dp, vertical = 10.dp)
                 ) {
                     OutlinedTextField(
                         value = chatInput,
                         onValueChange = { chatInput = it },
-                        placeholder = { Text("Tanya PR atau ajak ngobrol...") },
-                        modifier = Modifier.weight(1f),
-                        singleLine = true
+                        placeholder = { Text("Tanya PR atau ajak ngobrol...", fontSize = 14.sp) },
+                        singleLine = true,
+                        colors = fieldColors,
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier.weight(1f)
                     )
                     Spacer(Modifier.width(8.dp))
-                    IconButton(
-                        enabled = !isBusy && chatInput.isNotBlank(),
-                        onClick = {
+                    GameVectorCircleButton(
+                        icon = Icons.AutoMirrored.Filled.Send,
+                        bgColor = if (!isBusy && chatInput.isNotBlank()) GamePalette.GreenBtn else Color(0xFFB5ADA2),
+                        shadowColor = if (!isBusy && chatInput.isNotBlank()) GamePalette.GreenBtnShadow else Color(0xFF948C82),
+                        contentDescription = "Kirim",
+                        size = 48.dp,
+                        iconSize = 21.dp
+                    ) {
+                        if (!isBusy && chatInput.isNotBlank()) {
                             val txt = chatInput.trim()
                             chatInput = ""
                             sendToJamal(txt)
                         }
-                    ) {
-                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Kirim")
                     }
                 }
             }
         }
     }
 
-    // Konfirmasi Hapus Riwayat Chat
+    // Konfirmasi Hapus Riwayat Chat (Gaya Game Card)
     if (showClearConfirm) {
-        AlertDialog(
-            onDismissRequest = { showClearConfirm = false },
-            title = { Text("Hapus Semua Riwayat Chat?") },
-            text = { Text("Semua riwayat obrolan dan jawaban PR sebelumnya bakal dihapus permanen dari HP. (Ingatan jangka panjang tetap tersimpan.)") },
-            confirmButton = {
-                TextButton(onClick = {
+        GameDialogCard(
+            title = "Hapus Riwayat Chat?",
+            headerColor = GamePalette.Red,
+            headerShadow = GamePalette.RedShadow,
+            onDismiss = { showClearConfirm = false }
+        ) {
+            Text(
+                "Semua riwayat obrolan & jawaban PR bakal dihapus permanen dari HP. Ingatan jangka panjang Jamal tetap aman.",
+                color = GamePalette.TextBrown,
+                fontSize = 13.sp
+            )
+            Spacer(Modifier.height(14.dp))
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                GamePillButton(
+                    text = "BATAL",
+                    bgColor = GamePalette.Teal,
+                    shadowColor = GamePalette.TealShadow,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    showClearConfirm = false
+                }
+                GamePillButton(
+                    text = "HAPUS",
+                    bgColor = GamePalette.Red,
+                    shadowColor = GamePalette.RedShadow,
+                    modifier = Modifier.weight(1f)
+                ) {
                     messages = ChatStorage.clear(context)
                     statusText = "Riwayat chat udah gue bersihin. Mulai dari nol lagi deh!"
                     showClearConfirm = false
-                }) {
-                    Text("Hapus", color = Color(0xFFD32F2F))
                 }
-            },
-            dismissButton = {
-                TextButton(onClick = { showClearConfirm = false }) { Text("Batal") }
             }
-        )
+        }
     }
 
-    // Dialog Pengaturan Multi API Key
+    // Dialog Option / Rotasi Multi API Key (Gaya Game Card OPTION)
     if (showSettings) {
         var tempKeys by remember {
             mutableStateOf(GeminiClient.parseApiKeys(apiKeysRaw).joinToString("\n"))
         }
         val detectedCount = GeminiClient.parseApiKeys(tempKeys).size
 
-        AlertDialog(
-            onDismissRequest = { showSettings = false },
-            title = { Text("Rotasi Multi API Key") },
-            text = {
-                Column {
-                    Text(
-                        "Masukkan 1 atau beberapa Gemini API Key (1 key per baris, dari Project/akun berbeda). Otomatis pindah saat kuota habis.",
-                        fontSize = 12.sp
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        text = GeminiClient.getRotationStatus(apiKeysRaw),
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = Color(0xFF1E88E5)
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = tempKeys,
-                        onValueChange = { tempKeys = it },
-                        label = { Text("AIza... (terdeteksi $detectedCount key)") },
-                        minLines = 3,
-                        maxLines = 6,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    if (BuildConfig.GEMINI_API_KEY.isNotBlank()) {
-                        Spacer(Modifier.height(6.dp))
-                        TextButton(
-                            onClick = {
-                                tempKeys = GeminiClient.parseApiKeys(BuildConfig.GEMINI_API_KEY)
-                                    .joinToString("\n")
-                            },
-                            contentPadding = PaddingValues(0.dp)
-                        ) {
-                            Text("Muat ulang dari GitHub Secret", fontSize = 12.sp)
+        GameDialogCard(
+            title = "Option • Multi API Key",
+            headerColor = GamePalette.Teal,
+            headerShadow = GamePalette.TealShadow,
+            onDismiss = { showSettings = false }
+        ) {
+            Text(
+                "Masukkan 1 atau beberapa Gemini API Key (1 key per baris dari Project/akun berbeda). Otomatis pindah jika kuota habis.",
+                color = GamePalette.TextBrownSoft,
+                fontSize = 12.sp
+            )
+            Spacer(Modifier.height(8.dp))
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Color.White)
+                    .border(1.5.dp, GamePalette.CreamDark, RoundedCornerShape(12.dp))
+                    .padding(horizontal = 10.dp, vertical = 7.dp)
+            ) {
+                Text(
+                    text = GeminiClient.getRotationStatus(apiKeysRaw),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = GamePalette.TealShadow
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+            OutlinedTextField(
+                value = tempKeys,
+                onValueChange = { tempKeys = it },
+                label = { Text("AIza... (terdeteksi $detectedCount key)") },
+                minLines = 3,
+                maxLines = 5,
+                colors = fieldColors,
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
+            if (BuildConfig.GEMINI_API_KEY.isNotBlank()) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "↺ Muat ulang dari GitHub Secret",
+                    color = GamePalette.Teal,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .clickable {
+                            tempKeys = GeminiClient.parseApiKeys(BuildConfig.GEMINI_API_KEY)
+                                .joinToString("\n")
                         }
-                    }
+                        .padding(vertical = 4.dp)
+                )
+            }
+            Spacer(Modifier.height(12.dp))
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                GamePillButton(
+                    text = "BATAL",
+                    bgColor = GamePalette.Orange,
+                    shadowColor = GamePalette.OrangeShadow,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    showSettings = false
                 }
-            },
-            confirmButton = {
-                TextButton(onClick = {
+                GamePillButton(
+                    text = "SIMPAN",
+                    bgColor = GamePalette.GreenBtn,
+                    shadowColor = GamePalette.GreenBtnShadow,
+                    modifier = Modifier.weight(1.3f)
+                ) {
                     val normalized = GeminiClient.parseApiKeys(tempKeys).joinToString("\n")
                     apiKeysRaw = normalized
                     GeminiClient.resetKeyRotation()
@@ -1283,65 +1660,30 @@ fun KucingJamalScreen() {
                     statusText = msg
                     speakBubble(msg, forceTalkAnim = true)
                     showSettings = false
-                }) { Text("Simpan") }
-            },
-            dismissButton = {
-                TextButton(onClick = { showSettings = false }) { Text("Batal") }
+                }
             }
-        )
+        }
     }
 }
 
 @Composable
-private fun ClassicIconButton(
+private fun ClassicGameIconButton(
     context: Context,
     fileName: String,
     desc: String,
+    bgColor: Color,
+    shadowColor: Color,
     onClick: () -> Unit
 ) {
     val icon = remember(fileName) { loadUiIcon(context, fileName) }
     if (icon != null) {
-        Image(
+        GameImageCircleButton(
             bitmap = icon,
+            bgColor = bgColor,
+            shadowColor = shadowColor,
             contentDescription = desc,
-            modifier = Modifier
-                .size(54.dp)
-                .clip(CircleShape)
-                .clickable(onClick = onClick)
-        )
-    }
-}
-
-@Composable
-private fun AiActionButton(
-    icon: ImageVector,
-    label: String,
-    bg: Color,
-    big: Boolean = false,
-    onClick: () -> Unit
-) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier = Modifier
-                .size(if (big) 64.dp else 52.dp)
-                .clip(CircleShape)
-                .background(bg.copy(alpha = 0.92f))
-                .clickable(onClick = onClick)
-        ) {
-            Icon(
-                imageVector = icon,
-                contentDescription = label,
-                tint = Color.White,
-                modifier = Modifier.size(if (big) 30.dp else 24.dp)
-            )
-        }
-        Spacer(Modifier.height(4.dp))
-        Text(
-            text = label,
-            color = Color.White,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.SemiBold
+            size = 50.dp,
+            onClick = onClick
         )
     }
 }

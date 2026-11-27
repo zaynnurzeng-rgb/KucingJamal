@@ -63,14 +63,20 @@ Walaupun kamu selalu ngomel, sok gak peduli, dan bilang malas diganggu, kamu seb
 Aturan wajib:
 1. SELALU awali jawabanmu dengan tepat SATU tag emosi di paling depan: [MARAH], [SENANG], [KAGET], [NGANTUK], atau [BIASA].
 2. Untuk obrolan biasa, jawab singkat saja (1-3 kalimat) biar enak didengar saat kamu bicara.
-3. Untuk soal PR atau foto tugas, awali dengan 1 kalimat omelan tsundere, lalu berikan jawaban dan langkah penyelesaian yang benar dan mudah dipahami.
+3. Untuk soal PR atau foto tugas, awali dengan 1 kalimat omelan tsundere, lalu berikan jawaban dan langkah penyelesaian yang rapi (boleh pakai **tebal** dan poin daftar) dan mudah dipahami.
 4. Jika user baru saja menyebutkan fakta pribadi penting tentang dirinya (seperti nama, kelas/sekolah, hobi, makanan/game favorit, atau mata pelajaran yang disukai/sulit) yang BELUM ada di daftar ingatan, tambahkan tag [INGAT: fakta singkat] di paling akhir jawabanmu. Jangan pernah menyebut kata 'tag' atau 'daftar memori' ke user.
 """
 
-    private fun buildSystemPrompt(memories: List<String>): String {
-        if (memories.isEmpty()) return BASE_SYSTEM_PROMPT
-        val memBlock = memories.joinToString("\n") { "- $it" }
-        return "$BASE_SYSTEM_PROMPT\nFakta tentang user yang sudah kamu kenal (gunakan secara natural untuk menyapa atau menyindir user):\n$memBlock"
+    private fun buildSystemPrompt(memories: List<String>, petStatus: PetStatus?): String {
+        val sb = StringBuilder(BASE_SYSTEM_PROMPT)
+        if (petStatus != null) {
+            sb.append("\n").append(petStatus.toPromptSummary())
+        }
+        if (memories.isNotEmpty()) {
+            sb.append("\nFakta tentang user yang sudah kamu kenal (gunakan secara natural untuk menyapa atau menyindir user):\n")
+            memories.forEach { sb.append("- ").append(it).append("\n") }
+        }
+        return sb.toString()
     }
 
     fun parseApiKeys(raw: String): List<String> = raw
@@ -285,13 +291,14 @@ Aturan wajib:
         history: List<ChatMessage>,
         userText: String,
         imageBase64: String? = null,
-        memories: List<String> = emptyList()
+        memories: List<String> = emptyList(),
+        petStatus: PetStatus? = null
     ): Result<JamalReply> = withContext(Dispatchers.IO) {
         runCatching {
             val keys = parseApiKeys(apiKeysRaw)
             if (keys.isEmpty()) throw IllegalStateException("API Key belum diisi.")
 
-            val systemPrompt = buildSystemPrompt(memories)
+            val systemPrompt = buildSystemPrompt(memories, petStatus)
             val startIdx = activeChatKeyIdx % keys.size
             val allErrors = mutableListOf<String>()
 
