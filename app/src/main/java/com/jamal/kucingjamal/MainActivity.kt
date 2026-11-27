@@ -87,7 +87,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             MaterialTheme {
-                KucingJamalScreen()
+                JamalApp()
             }
         }
     }
