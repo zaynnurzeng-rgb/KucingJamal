@@ -61,6 +61,7 @@ object AppSettingsStorage {
     }
 
     private fun cacheDirs(context: Context): List<File> = listOf(
+        File(context.filesDir, "jamal_tts_v4"),
         File(context.filesDir, "jamal_tts_v3"),
         File(context.cacheDir, "jamal_tts_v2")
     )

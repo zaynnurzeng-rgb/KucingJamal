@@ -15,6 +15,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
@@ -39,7 +40,7 @@ private data class ModelCatalog(
 object GeminiClient {
     private val client = OkHttpClient.Builder()
         .connectTimeout(25, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
         .writeTimeout(25, TimeUnit.SECONDS)
         .build()
 
@@ -393,6 +394,62 @@ Aturan wajib:
         return digest.joinToString("") { "%02x".format(it) }
     }
 
+    private fun cleanForSpeech(text: String): String {
+        val lines = text.lines()
+            .map { line ->
+                line.replace(Regex("^\\s*#{1,6}\\s*"), "")
+                    .replace(Regex("^\\s*[•*-]\\s+"), "")
+                    .replace(Regex("[*_#`~]"), "")
+                    .replace(Regex("\\s+"), " ")
+                    .trim()
+            }
+            .filter { it.isNotEmpty() }
+        return lines.joinToString(" ") { line ->
+            val endChar = line.last()
+            if (endChar == '.' || endChar == '!' || endChar == '?' || endChar == ':' || endChar == ';' || endChar == ',') {
+                line
+            } else {
+                "$line."
+            }
+        }.trim()
+    }
+
+    private fun splitSpeechChunks(clean: String, maxChars: Int = 2200): List<String> {
+        if (clean.length <= maxChars) return listOf(clean)
+
+        val sentences = clean.split(Regex("(?<=[.!?])\\s+"))
+        val chunks = mutableListOf<String>()
+        val current = StringBuilder()
+
+        for (sentence in sentences) {
+            if (sentence.length > maxChars) {
+                if (current.isNotEmpty()) {
+                    chunks.add(current.toString().trim())
+                    current.clear()
+                }
+                var start = 0
+                while (start < sentence.length) {
+                    val end = minOf(start + maxChars, sentence.length)
+                    chunks.add(sentence.substring(start, end).trim())
+                    start = end
+                }
+            } else if (current.length + sentence.length + 1 > maxChars) {
+                if (current.isNotEmpty()) {
+                    chunks.add(current.toString().trim())
+                    current.clear()
+                }
+                current.append(sentence)
+            } else {
+                if (current.isNotEmpty()) current.append(' ')
+                current.append(sentence)
+            }
+        }
+        if (current.isNotEmpty()) {
+            chunks.add(current.toString().trim())
+        }
+        return chunks.filter { it.isNotEmpty() }
+    }
+
     private fun buildTtsBody(promptText: String, voiceName: String): String = JSONObject().apply {
         put(
             "contents",
@@ -421,6 +478,84 @@ Aturan wajib:
         )
     }.toString()
 
+    private suspend fun synthesizeSingleChunk(
+        keys: List<String>,
+        chunkText: String,
+        safeVoice: String
+    ): ByteArray {
+        val startIdx = activeTtsKeyIdx % keys.size
+        // Kirim teks murni tanpa instruksi bahasa Inggris agar tidak pernah terbaca
+        val promptVariants = listOf(
+            chunkText,
+            "\"$chunkText\""
+        )
+
+        val allErrors = mutableListOf<String>()
+
+        for (offset in keys.indices) {
+            val keyIdx = (startIdx + offset) % keys.size
+            val apiKey = keys[keyIdx]
+            val catalog = ensureModelCatalog(apiKey)
+            val candidates = (catalog.ttsModels + listOf("gemini-2.5-flash-preview-tts")).distinct()
+
+            var keyInvalid = false
+
+            for (ttsModel in candidates) {
+                for (promptText in promptVariants) {
+                    val bodyJson = buildTtsBody(promptText, safeVoice)
+                    val url = "https://generativelanguage.googleapis.com/v1beta/models/$ttsModel:generateContent?key=$apiKey"
+                    val req = Request.Builder()
+                        .url(url)
+                        .post(bodyJson.toRequestBody(JSON_TYPE))
+                        .build()
+
+                    val (isOk, code, raw) = client.newCall(req).execute().use { resp ->
+                        Triple(resp.isSuccessful, resp.code, resp.body?.string().orEmpty())
+                    }
+
+                    if (isOk) {
+                        val json = JSONObject(raw)
+                        val b64 = extractAudioBase64(json)
+                        if (b64 != null) {
+                            val pcm = Base64.decode(b64, Base64.DEFAULT)
+                            if (pcm.isNotEmpty()) {
+                                activeTtsKeyIdx = keyIdx
+                                return pcm
+                            }
+                        }
+                        val finishReason = json.optJSONArray("candidates")
+                            ?.optJSONObject(0)
+                            ?.optString("finishReason", "NO_AUDIO")
+                            ?: "NO_AUDIO"
+                        allErrors.add("[Key #${keyIdx + 1} $ttsModel] Kosong: $finishReason")
+                        continue
+                    }
+
+                    val errMsg = "[Key #${keyIdx + 1} $ttsModel] HTTP $code: ${extractApiErrorMessage(raw).take(60)}"
+                    allErrors.add(errMsg)
+
+                    if (code == 401 || code == 403) {
+                        keyInvalid = true
+                        break
+                    }
+                    if (code == 400) {
+                        continue
+                    }
+                    if (code == 429 || code == 503 || code >= 500) {
+                        delay(250L)
+                        break
+                    }
+                    if (code == 404) {
+                        break
+                    }
+                }
+                if (keyInvalid) break
+            }
+        }
+
+        throw IllegalStateException(allErrors.takeLast(3).joinToString(" -> "))
+    }
+
     suspend fun synthesizeVoiceCached(
         context: Context,
         apiKeysRaw: String,
@@ -428,103 +563,30 @@ Aturan wajib:
         voiceName: String = "Puck"
     ): Result<ByteArray> = withContext(Dispatchers.IO) {
         runCatching {
-            val clean = text
-                .replace(Regex("[*_#`~]"), "")
-                .replace(Regex("\\s+"), " ")
-                .trim()
-                .take(400)
-
+            val clean = cleanForSpeech(text)
             if (clean.isBlank()) throw IllegalArgumentException("Teks kosong")
 
             val safeVoice = voiceName.trim().ifBlank { "Puck" }
-            val cacheDir = File(context.filesDir, "jamal_tts_v3").apply { mkdirs() }
+            val cacheDir = File(context.filesDir, "jamal_tts_v4").apply { mkdirs() }
             val cacheFile = File(cacheDir, "${safeVoice.lowercase()}_${sha256(clean)}.pcm")
             if (cacheFile.exists() && cacheFile.length() > 100L) {
                 return@runCatching cacheFile.readBytes()
             }
 
-            // Kompatibilitas cache lama khusus Puck
-            if (safeVoice.equals("Puck", ignoreCase = true)) {
-                val legacyFile = File(cacheDir, "${sha256(clean)}.pcm")
-                if (legacyFile.exists() && legacyFile.length() > 100L) {
-                    return@runCatching legacyFile.readBytes()
-                }
-            }
-
             val keys = parseApiKeys(apiKeysRaw)
             if (keys.isEmpty()) throw IllegalStateException("API Key belum diisi.")
 
-            val startIdx = activeTtsKeyIdx % keys.size
-            val promptVariants = listOf(
-                "Say sarcastically: $clean",
-                clean
-            )
-
-            val allErrors = mutableListOf<String>()
-
-            for (offset in keys.indices) {
-                val keyIdx = (startIdx + offset) % keys.size
-                val apiKey = keys[keyIdx]
-                val catalog = ensureModelCatalog(apiKey)
-                val candidates = (catalog.ttsModels + listOf("gemini-2.5-flash-preview-tts")).distinct()
-
-                var keyInvalid = false
-
-                for (ttsModel in candidates) {
-                    for (promptText in promptVariants) {
-                        val bodyJson = buildTtsBody(promptText, safeVoice)
-                        val url = "https://generativelanguage.googleapis.com/v1beta/models/$ttsModel:generateContent?key=$apiKey"
-                        val req = Request.Builder()
-                            .url(url)
-                            .post(bodyJson.toRequestBody(JSON_TYPE))
-                            .build()
-
-                        val (isOk, code, raw) = client.newCall(req).execute().use { resp ->
-                            Triple(resp.isSuccessful, resp.code, resp.body?.string().orEmpty())
-                        }
-
-                        if (isOk) {
-                            val json = JSONObject(raw)
-                            val b64 = extractAudioBase64(json)
-                            if (b64 != null) {
-                                val pcm = Base64.decode(b64, Base64.DEFAULT)
-                                if (pcm.isNotEmpty()) {
-                                    activeTtsKeyIdx = keyIdx
-                                    runCatching { cacheFile.writeBytes(pcm) }
-                                    return@runCatching pcm
-                                }
-                            }
-                            val finishReason = json.optJSONArray("candidates")
-                                ?.optJSONObject(0)
-                                ?.optString("finishReason", "NO_AUDIO")
-                                ?: "NO_AUDIO"
-                            allErrors.add("[Key #${keyIdx + 1} $ttsModel] Kosong: $finishReason")
-                            continue
-                        }
-
-                        val errMsg = "[Key #${keyIdx + 1} $ttsModel] HTTP $code: ${extractApiErrorMessage(raw).take(60)}"
-                        allErrors.add(errMsg)
-
-                        if (code == 401 || code == 403) {
-                            keyInvalid = true
-                            break
-                        }
-                        if (code == 400) {
-                            continue
-                        }
-                        if (code == 429 || code == 503 || code >= 500) {
-                            delay(250L)
-                            break
-                        }
-                        if (code == 404) {
-                            break
-                        }
-                    }
-                    if (keyInvalid) break
-                }
+            val chunks = splitSpeechChunks(clean, maxChars = 2200)
+            val combined = ByteArrayOutputStream()
+            for (chunk in chunks) {
+                val pcm = synthesizeSingleChunk(keys, chunk, safeVoice)
+                combined.write(pcm)
             }
 
-            throw IllegalStateException(allErrors.takeLast(3).joinToString(" -> "))
+            val finalPcm = combined.toByteArray()
+            if (finalPcm.isEmpty()) throw IllegalStateException("Audio kosong.")
+            runCatching { cacheFile.writeBytes(finalPcm) }
+            finalPcm
         }
     }
 }
@@ -574,6 +636,7 @@ class PcmAudioPlayer {
             }
             if (isActive && currentTrack === track) {
                 track.stop()
+                delay(220L)
             }
         } catch (_: Exception) {
         } finally {
