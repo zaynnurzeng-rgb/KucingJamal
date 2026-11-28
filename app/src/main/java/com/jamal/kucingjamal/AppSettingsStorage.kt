@@ -7,7 +7,8 @@ import java.util.Locale
 data class AppSettings(
     val voiceName: String = "Puck",
     val mimicPitch: Float = 1.48f,
-    val animFps: Int = 16
+    val animFps: Int = 16,
+    val notificationsEnabled: Boolean = true
 )
 
 data class VoiceOption(
@@ -34,6 +35,7 @@ object AppSettingsStorage {
     private const val KEY_VOICE = "voice_name"
     private const val KEY_PITCH = "mimic_pitch"
     private const val KEY_FPS = "anim_fps"
+    private const val KEY_NOTIF = "notifications_enabled"
 
     val availableVoices = listOf(
         VoiceOption("Puck", "Usil"),
@@ -48,7 +50,13 @@ object AppSettingsStorage {
         val voice = prefs.getString(KEY_VOICE, "Puck").orEmpty().ifBlank { "Puck" }
         val pitch = prefs.getFloat(KEY_PITCH, 1.48f).coerceIn(1.15f, 1.75f)
         val fps = prefs.getInt(KEY_FPS, 16).coerceIn(12, 24)
-        return AppSettings(voiceName = voice, mimicPitch = pitch, animFps = fps)
+        val notif = prefs.getBoolean(KEY_NOTIF, true)
+        return AppSettings(
+            voiceName = voice,
+            mimicPitch = pitch,
+            animFps = fps,
+            notificationsEnabled = notif
+        )
     }
 
     fun save(context: Context, settings: AppSettings) {
@@ -57,6 +65,7 @@ object AppSettingsStorage {
             .putString(KEY_VOICE, settings.voiceName)
             .putFloat(KEY_PITCH, settings.mimicPitch.coerceIn(1.15f, 1.75f))
             .putInt(KEY_FPS, settings.animFps.coerceIn(12, 24))
+            .putBoolean(KEY_NOTIF, settings.notificationsEnabled)
             .apply()
     }
 

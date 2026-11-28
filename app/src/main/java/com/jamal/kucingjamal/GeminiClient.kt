@@ -370,6 +370,147 @@ Aturan wajib:
         }
     }
 
+    private fun parseQuizJson(rawText: String): List<QuizQuestion> {
+        val cleaned = rawText
+            .replace(Regex("```json", RegexOption.IGNORE_CASE), "")
+            .replace("```", "")
+            .trim()
+
+        val startArr = cleaned.indexOf('[')
+        val endArr = cleaned.lastIndexOf(']')
+        if (startArr == -1 || endArr <= startArr) {
+            throw IllegalStateException("Format soal JSON tidak valid.")
+        }
+
+        val arr = JSONArray(cleaned.substring(startArr, endArr + 1))
+        val parsed = mutableListOf<QuizQuestion>()
+
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            val qText = obj.optString("question", "").trim()
+            val optsJson = obj.optJSONArray("options") ?: continue
+            val opts = mutableListOf<String>()
+            for (j in 0 until optsJson.length()) {
+                val o = optsJson.optString(j, "").trim()
+                if (o.isNotEmpty()) opts.add(o)
+            }
+            val correctIdx = obj.optInt("correctIndex", -1)
+            val explanation = obj.optString("explanation", "Sudah jelas kan!").trim()
+
+            if (qText.isNotEmpty() && opts.size == 4 && correctIdx in 0..3) {
+                parsed.add(QuizQuestion(qText, opts, correctIdx, explanation))
+            }
+        }
+
+        if (parsed.size < 3) {
+            throw IllegalStateException("Soal kuis kurang lengkap.")
+        }
+        return parsed.take(3)
+    }
+
+    suspend fun generateQuiz(
+        apiKeysRaw: String,
+        topic: String,
+        difficulty: String
+    ): Result<List<QuizQuestion>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val keys = parseApiKeys(apiKeysRaw)
+            if (keys.isEmpty()) throw IllegalStateException("API Key belum diisi.")
+
+            val quizPrompt = """
+Buatkan tepat 3 soal kuis pilihan ganda dalam bahasa Indonesia tentang topik "$topic" dengan tingkat kesulitan "$difficulty".
+Balas HANYA dengan array JSON valid (tanpa teks pembuka, tanpa markdown) dengan struktur persis seperti ini:
+[
+  {
+    "question": "Teks pertanyaan singkat dan jelas",
+    "options": ["Pilihan 1", "Pilihan 2", "Pilihan 3", "Pilihan 4"],
+    "correctIndex": 0,
+    "explanation": "Penjelasan singkat 1 kalimat kenapa jawaban itu benar"
+  }
+]
+Pastikan pilihan jawaban tanpa awalan huruf A/B/C/D dan posisi correctIndex (0-3) bervariasi.
+""".trimIndent()
+
+            val startIdx = activeChatKeyIdx % keys.size
+            val allErrors = mutableListOf<String>()
+
+            for (offset in keys.indices) {
+                val keyIdx = (startIdx + offset) % keys.size
+                val apiKey = keys[keyIdx]
+                val catalog = ensureModelCatalog(apiKey)
+
+                val fullChain = buildList {
+                    addAll(catalog.hydrogenModels.take(2))
+                    addAll(CHAT_FALLBACK_CHAIN)
+                }.distinct()
+
+                var keyInvalid = false
+
+                for (model in fullChain) {
+                    val isHydrogen = model.contains("hydrogen", ignoreCase = true)
+                    val thinkingModes = if (isHydrogen) listOf("LEVEL_LOW", "BUDGET_LOW") else listOf(null)
+
+                    for (tMode in thinkingModes) {
+                        val contents = JSONArray().put(
+                            JSONObject().apply {
+                                put("role", "user")
+                                put("parts", JSONArray().put(JSONObject().put("text", quizPrompt)))
+                            }
+                        )
+                        val bodyJson = JSONObject().apply {
+                            if (tMode != null) {
+                                val thinkingObj = JSONObject().apply {
+                                    when (tMode) {
+                                        "LEVEL_LOW" -> put("thinkingLevel", "LOW")
+                                        "BUDGET_LOW" -> put("thinkingBudget", 1024)
+                                    }
+                                }
+                                put("generationConfig", JSONObject().put("thinkingConfig", thinkingObj))
+                            }
+                            put("contents", contents)
+                        }.toString()
+
+                        val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+                        val req = Request.Builder()
+                            .url(url)
+                            .post(bodyJson.toRequestBody(JSON_TYPE))
+                            .build()
+
+                        val (isOk, code, raw) = client.newCall(req).execute().use { resp ->
+                            Triple(resp.isSuccessful, resp.code, resp.body?.string().orEmpty())
+                        }
+
+                        if (isOk) {
+                            val replyRaw = extractReplyText(JSONObject(raw))
+                            val parsed = runCatching { parseQuizJson(replyRaw) }.getOrNull()
+                            if (parsed != null) {
+                                activeChatKeyIdx = keyIdx
+                                return@runCatching parsed
+                            }
+                            allErrors.add("[$model] Format JSON meleset")
+                            break
+                        }
+
+                        val errMsg = "[Key #${keyIdx + 1} $model] HTTP $code: ${extractApiErrorMessage(raw).take(60)}"
+                        if (code == 401 || code == 403) {
+                            allErrors.add(errMsg)
+                            keyInvalid = true
+                            break
+                        }
+                        if (code == 400 && tMode == "LEVEL_LOW") {
+                            continue
+                        }
+                        allErrors.add(errMsg)
+                        break
+                    }
+                    if (keyInvalid) break
+                }
+            }
+
+            throw IllegalStateException(allErrors.takeLast(3).joinToString(" -> "))
+        }
+    }
+
     private fun parseReply(raw: String): JamalReply {
         val memRegex = Regex("\\[INGAT:\\s*([^\\]]+)]", RegexOption.IGNORE_CASE)
         val extractedMemories = memRegex.findAll(raw)
@@ -484,7 +625,6 @@ Aturan wajib:
         safeVoice: String
     ): ByteArray {
         val startIdx = activeTtsKeyIdx % keys.size
-        // Kirim teks murni tanpa instruksi bahasa Inggris agar tidak pernah terbaca
         val promptVariants = listOf(
             chunkText,
             "\"$chunkText\""

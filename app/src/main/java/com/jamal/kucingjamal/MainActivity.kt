@@ -11,6 +11,7 @@ import android.media.AudioAttributes
 import android.media.ExifInterface
 import android.media.SoundPool
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -46,6 +47,7 @@ import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Chat
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PhotoLibrary
@@ -119,6 +121,20 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 JamalApp()
             }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        JamalReminderScheduler.clearDelivered(this)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (AppSettingsStorage.load(this).notificationsEnabled) {
+            JamalReminderScheduler.scheduleReminder(this)
+        } else {
+            JamalReminderScheduler.cancelReminder(this)
         }
     }
 }
@@ -198,6 +214,7 @@ fun KucingJamalScreen() {
     var appSettings by remember { mutableStateOf(AppSettingsStorage.load(context)) }
     var showSettings by remember { mutableStateOf(false) }
     var showMemoryDialog by remember { mutableStateOf(false) }
+    var showQuizDialog by remember { mutableStateOf(false) }
     var showChat by remember { mutableStateOf(false) }
     var showClearConfirm by remember { mutableStateOf(false) }
     var showPhotoSourceDialog by remember { mutableStateOf(false) }
@@ -205,6 +222,7 @@ fun KucingJamalScreen() {
     var prNoteInput by remember { mutableStateOf("") }
     var cameraPhotoUri by remember { mutableStateOf<Uri?>(null) }
     var pendingMicAction by remember { mutableStateOf("ai") }
+    var pendingNotifTest by remember { mutableStateOf(false) }
 
     var chatInput by remember { mutableStateOf("") }
     var messages by remember { mutableStateOf(ChatStorage.load(context)) }
@@ -373,8 +391,29 @@ fun KucingJamalScreen() {
         }
     }
 
+    val notifPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            JamalReminderScheduler.scheduleReminder(context)
+            if (pendingNotifTest) {
+                pendingNotifTest = false
+                JamalReminderScheduler.showNotification(context, isTest = true)
+            }
+        } else {
+            pendingNotifTest = false
+            statusText = "Izin notifikasi ditolak, yaudah gue gak bisa bangunin lu deh."
+        }
+    }
+
     LaunchedEffect(Unit) {
         markActive()
+        if (appSettings.notificationsEnabled &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            !JamalReminderScheduler.hasNotificationPermission(context)
+        ) {
+            notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
         if (hasValidKeys()) {
             delay(350L)
             speakBubble(statusText, forceTalkAnim = true)
@@ -604,7 +643,7 @@ fun KucingJamalScreen() {
         }
     }
 
-    // Engine Animasi Dinamis (mengikuti slider FPS di Option: 12-24 fps) + Idle Otomatis
+    // Engine Animasi Dinamis (12-24 fps) + Idle Otomatis
     LaunchedEffect(currentAnim, triggerCount) {
         when (currentAnim) {
             JamalAnim.IDLE -> {
@@ -617,7 +656,7 @@ fun KucingJamalScreen() {
 
                     val idleMs = System.currentTimeMillis() - lastInteractionAt
                     val overlayOpen = showChat || showSettings || showMemoryDialog ||
-                        showPhotoSourceDialog || pendingPrPhoto != null
+                        showQuizDialog || showPhotoSourceDialog || pendingPrPhoto != null
                     if (idleMs >= 20_000L && !isBusy && !isSpeaking && !isListening && !isMimicRecording && !overlayOpen) {
                         if ((0..1).random() == 0) {
                             playAnim(
@@ -904,7 +943,7 @@ fun KucingJamalScreen() {
             }
         }
 
-        // Layer 3: Tombol Aksi Klasik + Makan (Sisi Kiri)
+        // Layer 3A: Tombol Aksi Klasik + Makan (Sisi Kiri)
         Column(
             verticalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier
@@ -961,6 +1000,33 @@ fun KucingJamalScreen() {
                     "Rasain nih cakaran gue!",
                     deltaMood = -8
                 )
+            }
+        }
+
+        // Layer 3B: Tombol Mini-Game Kuis Kilat (Sisi Kanan)
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = 10.dp)
+        ) {
+            GameVectorCircleButton(
+                icon = Icons.Filled.EmojiEvents,
+                bgColor = Color(0xFFFFB300),
+                shadowColor = Color(0xFFC68400),
+                contentDescription = "Kuis Kilat",
+                size = 54.dp,
+                iconSize = 26.dp,
+                label = "Kuis"
+            ) {
+                markActive()
+                if (!hasValidKeys()) {
+                    statusText = "Isi Gemini API Key dulu di tombol Option kanan atas!"
+                    showSettings = true
+                } else {
+                    stopCurrentSpeech()
+                    showQuizDialog = true
+                }
             }
         }
 
@@ -1032,6 +1098,24 @@ fun KucingJamalScreen() {
                 showChat = true
             }
         }
+    }
+
+    // Dialog Mini-Game Kuis Kilat + Kartu Skor 3 Bintang
+    if (showQuizDialog) {
+        QuizGameDialog(
+            apiKeysRaw = apiKeysRaw,
+            onDismiss = { showQuizDialog = false },
+            onQuizFinished = { score, total, comment ->
+                val moodDelta = when {
+                    score >= total -> 14
+                    score == 2 -> 6
+                    score == 1 -> 0
+                    else -> -6
+                }
+                val anim = if (score >= 2) JamalAnim.HAPPY_SHORT else JamalAnim.ANGRY
+                playAnim(anim, comment, speak = true, deltaHunger = -4, deltaMood = moodDelta)
+            }
+        )
     }
 
     // Dialog Memori Jangka Panjang Kucing Jamal
@@ -1570,7 +1654,7 @@ fun KucingJamalScreen() {
         }
     }
 
-    // Dialog Option Lengkap (Suara Gemini + Pitch Tirukan + FPS Animasi + Cache + Multi API Key)
+    // Dialog Option Lengkap (Suara + Pitch + FPS + Notifikasi Tsundere + Cache + Multi API Key)
     if (showSettings) {
         var tempKeys by remember {
             mutableStateOf(GeminiClient.parseApiKeys(apiKeysRaw).joinToString("\n"))
@@ -1578,6 +1662,7 @@ fun KucingJamalScreen() {
         var tempVoice by remember { mutableStateOf(appSettings.voiceName) }
         var tempPitch by remember { mutableFloatStateOf(appSettings.mimicPitch) }
         var tempFps by remember { mutableIntStateOf(appSettings.animFps) }
+        var tempNotif by remember { mutableStateOf(appSettings.notificationsEnabled) }
         var cacheStats by remember { mutableStateOf(AppSettingsStorage.getTtsCacheStats(context)) }
         val detectedCount = GeminiClient.parseApiKeys(tempKeys).size
 
@@ -1675,7 +1760,65 @@ fun KucingJamalScreen() {
 
                 Spacer(Modifier.height(6.dp))
 
-                // 4. Cache Suara
+                // 4. Notifikasi Pengingat Tsundere (Offline)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color.White)
+                        .border(1.5.dp, GamePalette.CreamDark, RoundedCornerShape(14.dp))
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "NOTIFIKASI TSUNDERE",
+                            color = GamePalette.TextBrown,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                        Text(
+                            text = "Ingatkan offline saat lapar/lama dicuekin",
+                            color = GamePalette.TextBrownSoft,
+                            fontSize = 11.sp
+                        )
+                    }
+                    Switch(
+                        checked = tempNotif,
+                        onCheckedChange = { checked ->
+                            tempNotif = checked
+                            if (checked && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                !JamalReminderScheduler.hasNotificationPermission(context)
+                            ) {
+                                pendingNotifTest = false
+                                notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            }
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.White,
+                            checkedTrackColor = GamePalette.GreenBtn
+                        )
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    GamePillButton(
+                        text = "TES",
+                        bgColor = GamePalette.Orange,
+                        shadowColor = GamePalette.OrangeShadow,
+                        fontSize = 10.sp
+                    ) {
+                        if (JamalReminderScheduler.hasNotificationPermission(context)) {
+                            JamalReminderScheduler.showNotification(context, isTest = true)
+                        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            pendingNotifTest = true
+                            notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(10.dp))
+
+                // 5. Cache Suara
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -1713,7 +1856,7 @@ fun KucingJamalScreen() {
 
                 Spacer(Modifier.height(12.dp))
 
-                // 5. Rotasi Multi API Key
+                // 6. Rotasi Multi API Key
                 Text(
                     text = "ROTASI MULTI API KEY",
                     color = GamePalette.TextBrown,
@@ -1794,10 +1937,17 @@ fun KucingJamalScreen() {
                     val newSettings = AppSettings(
                         voiceName = tempVoice,
                         mimicPitch = tempPitch,
-                        animFps = tempFps
+                        animFps = tempFps,
+                        notificationsEnabled = tempNotif
                     )
                     appSettings = newSettings
                     AppSettingsStorage.save(context, newSettings)
+
+                    if (tempNotif) {
+                        JamalReminderScheduler.scheduleReminder(context)
+                    } else {
+                        JamalReminderScheduler.cancelReminder(context)
+                    }
 
                     if (normalized != apiKeysRaw) {
                         apiKeysRaw = normalized

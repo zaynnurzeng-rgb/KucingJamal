@@ -5,6 +5,9 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -57,8 +60,31 @@ jobs:
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
         run: gradle assembleRelease --no-daemon
 
-      - name: Upload Release APK
+      - name: Upload Artifact APK
         uses: actions/upload-artifact@v4
         with:
           name: KucingJamal-Release-APK
           path: app/build/outputs/apk/release/app-release.apk
+
+      - name: Publish ke GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v1.0.${{ github.run_number }}"
+          APK_NAME="KucingJamal-${TAG}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$APK_NAME"
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+
+          cat << NOTES > release_notes.md
+          ### 🐱 Kucing Jamal ${TAG}
+
+          **Perubahan terbaru:**
+          - ${COMMIT_MSG}
+
+          **Cara pasang:**
+          Unduh file **\`${APK_NAME}\`** pada bagian *Assets* di bawah lalu instal langsung di HP Android (minimal Android 8.0).
+          NOTES
+
+          gh release create "$TAG" "$APK_NAME" \
+            --title "Kucing Jamal ${TAG}" \
+            --notes-file release_notes.md
